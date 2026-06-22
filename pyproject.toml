@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "device_package_example"
+version = "0.1.0"
+description = "Uni-Lab-OS external device package example"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "rich",
+]
+
+[project.optional-dependencies]
+dev = [
+    "unilabos",
+]
+
+[tool.setuptools.packages.find]
+include = ["device_package_example*"]
