@@ -64,34 +64,405 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
             if display_name not in reverse_type_mapping:
                 reverse_type_mapping[display_name] = (key, resource_uuid)
 
+    type_id_mapping = {}
+    type_code_mapping = {}
+    for key, value in type_mapping.items():
+        if isinstance(value, (tuple, list)) and len(value) >= 2 and value[1]:
+            type_id_mapping[str(value[1])] = (key, value[1])
+
+    try:
+        from unilabos.registry.registry import lab_registry
+
+        for resource_id, value in type_mapping.items():
+            resource_config = lab_registry.resource_type_registry.get(resource_id, {})
+            class_config = resource_config.get("class")
+            resource_cls = None
+            if inspect.isclass(class_config):
+                resource_cls = class_config
+            elif isinstance(class_config, dict) and "module" in class_config:
+                module_name, class_name = class_config["module"].split(":", 1)
+                try:
+                    module = importlib.import_module(module_name)
+                    resource_cls = getattr(module, class_name, None)
+                except Exception:
+                    resource_cls = None
+            if resource_cls is None:
+                continue
+
+            discovered_codes = set()
+            type_code = getattr(resource_cls, "bioyond_material_type_code", None)
+            if type_code:
+                discovered_codes.add(str(type_code))
+
+            resource_module = inspect.getmodule(resource_cls)
+            code_to_class = getattr(resource_module, "MATERIAL_TYPE_CODE_TO_CLASS", {})
+            if isinstance(code_to_class, dict):
+                for mapped_code, mapped_cls in code_to_class.items():
+                    if mapped_cls is resource_cls or getattr(mapped_cls, "resource_id", None) == resource_id:
+                        discovered_codes.add(str(mapped_code))
+
+            type_uuid = value[1] if isinstance(value, (tuple, list)) and len(value) >= 2 else ""
+            for discovered_code in discovered_codes:
+                type_code_mapping[discovered_code] = (resource_id, type_uuid)
+    except Exception as exc:
+        logger.debug(f"[反向映射表] 构建 Bioyond type code 映射失败: {exc}")
+
+    try:
+        from bioyond_peptide_station.resources import peptide_materials
+
+        for mapped_code, mapped_cls in getattr(peptide_materials, "MATERIAL_TYPE_CODE_TO_CLASS", {}).items():
+            resource_id = getattr(mapped_cls, "resource_id", None)
+            if not resource_id or resource_id not in type_mapping:
+                continue
+            value = type_mapping.get(resource_id) or []
+            type_uuid = value[1] if isinstance(value, (tuple, list)) and len(value) >= 2 else ""
+            type_code_mapping[str(mapped_code)] = (resource_id, type_uuid)
+    except Exception as exc:
+        logger.debug(f"[反向映射表] 加载 peptide type code 映射失败: {exc}")
+
     logger.debug(f"[反向映射表] 共 {len(reverse_type_mapping)} 个条目: {list(reverse_type_mapping.keys())}")
 
+    def _clean_mapping_key(value):
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    def _material_type_code(material):
+        code = _clean_mapping_key(
+            material.get("typeCode")
+            or material.get("materialTypeCode")
+            or material.get("code")
+            or material.get("materialCode")
+        )
+        if not code:
+            return None
+        return code.split("-", 1)[0]
+
+    def _resolve_material_type(material):
+        type_code = _material_type_code(material)
+        if type_code and type_code in type_code_mapping:
+            return type_code_mapping[type_code], "code", type_code
+
+        if not type_code:
+            return ("RegularContainer", ""), "regular_container_missing_code", None
+
+        return ("RegularContainer", ""), "regular_container_unmapped_code", type_code
+
+
+    def _iter_resource_names(resource):
+        yield getattr(resource, "name", None)
+        for child in getattr(resource, "children", []) or []:
+            yield from _iter_resource_names(child)
+
+    existing_names = {
+        name for name in (_iter_resource_names(deck) if deck is not None else []) if name
+    }
+
+    def _is_synthesis_plate(resource):
+        return getattr(resource, "model", None) == "bioyond_peptide_96_well_synthesis_plate"
+
+    def _is_synthesis_base(resource):
+        return getattr(resource, "model", None) == "bioyond_peptide_96_well_synthesis_plate_base"
+
+    def _clear_site_if_current(parent, child):
+        sites = getattr(parent, "sites", None)
+        if isinstance(sites, list):
+            for site_idx, occupant in enumerate(sites):
+                if occupant is child:
+                    sites[site_idx] = None
+                    break
+        if child in getattr(parent, "children", []):
+            parent.children.remove(child)
+        if getattr(child, "parent", None) is parent:
+            child.parent = None
+
+    def _value_field(value, key):
+        if isinstance(value, dict):
+            return value.get(key)
+        return getattr(value, key, None)
+
+    def _legacy_bioyond_id_from_value(value, allow_payload_id=False):
+        if value is None:
+            return None
+        material_id = _clean_mapping_key(_value_field(value, "material_bioyond_id"))
+        if material_id:
+            return material_id
+        # 迁移兼容：旧资源树可能只有别名字段或嵌套原始载荷。
+        for key in ("bioyond_id", "bioyond_material_id"):
+            material_id = _clean_mapping_key(_value_field(value, key))
+            if material_id:
+                return material_id
+        if allow_payload_id:
+            for key in ("id", "materialId", "material_id"):
+                material_id = _clean_mapping_key(_value_field(value, key))
+                if material_id:
+                    return material_id
+        nested = _value_field(value, "bioyond_material")
+        if nested is not None:
+            material_id = _legacy_bioyond_id_from_value(nested, allow_payload_id=False)
+            if material_id:
+                return material_id
+            raw_payload = _value_field(nested, "raw_payload")
+            material_id = _legacy_bioyond_id_from_value(raw_payload, allow_payload_id=True)
+            if material_id:
+                return material_id
+        raw_payload = _value_field(value, "raw_payload")
+        if raw_payload is not None:
+            material_id = _legacy_bioyond_id_from_value(raw_payload, allow_payload_id=True)
+            if material_id:
+                return material_id
+        return None
+
+    def _resource_bioyond_id(resource):
+        extra_info = getattr(resource, "unilabos_extra", {}) or {}
+        material_id = _clean_mapping_key(extra_info.get("material_bioyond_id"))
+        if material_id:
+            return material_id
+        return _legacy_bioyond_id_from_value(extra_info) or _legacy_bioyond_id_from_value(resource)
+
+    def _combined_parent_id(material):
+        return _clean_mapping_key(
+            material.get("combinedMaterialId")
+            or material.get("combined_material_id")
+            or material.get("combined_materialId")
+        )
+
+    def _first_location_key_from_locations(locations):
+        if not isinstance(locations, list) or not locations:
+            return None
+        location = locations[0] or {}
+        return (
+            location.get("whName"),
+            location.get("x"),
+            location.get("y"),
+            location.get("z"),
+        )
+
+    def _first_location_key_from_resource(resource):
+        extra_info = getattr(resource, "unilabos_extra", {}) or {}
+        return _first_location_key_from_locations(extra_info.get("bioyond_material_locations"))
+
+    def _iter_resource_subtree(resource):
+        yield resource
+        for child in getattr(resource, "children", []) or []:
+            yield from _iter_resource_subtree(child)
+
+    resources_by_bioyond_id = {}
+    if deck is not None:
+        for resource in _iter_resource_subtree(deck):
+            material_id = _resource_bioyond_id(resource)
+            if material_id:
+                resources_by_bioyond_id[material_id] = resource
+
+    def _assign_child_to_parent_slot(parent, child):
+        if getattr(child, "parent", None) is parent:
+            return True
+        if not hasattr(parent, "__setitem__"):
+            logger.warning(
+                f"[组合物料] 父物料 {getattr(parent, 'name', None)} 没有可挂载槽位，"
+                f"跳过子物料 {getattr(child, 'name', None)}"
+            )
+            return False
+        try:
+            current = parent[0]
+        except Exception as exc:
+            logger.warning(
+                f"[组合物料] 读取父物料 {getattr(parent, 'name', None)} 槽位失败，"
+                f"跳过子物料 {getattr(child, 'name', None)}: {exc}"
+            )
+            return False
+        if current is child:
+            return True
+        if isinstance(current, str):
+            parent.sites[0] = None
+        elif current is not None and current is not child:
+            try:
+                parent.unassign_child_resource(current)
+            except Exception:
+                _clear_site_if_current(parent, current)
+        old_parent = getattr(child, "parent", None)
+        if old_parent is not None:
+            try:
+                old_parent.unassign_child_resource(child)
+            except Exception:
+                _clear_site_if_current(old_parent, child)
+        try:
+            parent[0] = child
+        except Exception as exc:
+            logger.warning(
+                f"[组合物料] 挂载子物料 {getattr(child, 'name', None)} 到 "
+                f"{getattr(parent, 'name', None)} 失败: {exc}"
+            )
+            return False
+        return getattr(child, "parent", None) is parent
+
+    pending_combined_children = []
+
+    def _try_attach_combined_children():
+        attached_count = 0
+        remaining = []
+        for parent_id, child, child_location_key, placed_by_location in pending_combined_children:
+            parent = resources_by_bioyond_id.get(parent_id)
+            if parent is None:
+                remaining.append((parent_id, child, child_location_key, placed_by_location))
+                continue
+            parent_location_key = _first_location_key_from_resource(parent)
+            if child_location_key is not None and child_location_key != parent_location_key:
+                logger.debug(
+                    f"[组合物料] 子物料 {getattr(child, 'name', None)} "
+                    f"combinedMaterialId={parent_id} 但自身位置 {child_location_key} "
+                    f"不同于父物料位置 {parent_location_key}，按自身 locations[] 放置"
+                )
+                continue
+            if _assign_child_to_parent_slot(parent, child):
+                attached_count += 1
+                logger.info(
+                    f"[组合物料] 子物料 {getattr(child, 'name', None)} "
+                    f"按 combinedMaterialId={parent_id} 挂载到父物料 {getattr(parent, 'name', None)}"
+                )
+            else:
+                remaining.append((parent_id, child, child_location_key, placed_by_location))
+        pending_combined_children[:] = remaining
+        return attached_count
+
+    def _assign_plate_to_synthesis_base(base, plate):
+        if getattr(plate, "parent", None) is base:
+            return True
+        current = base[0] if hasattr(base, "__getitem__") else None
+        if current is plate:
+            return True
+        if isinstance(current, str):
+            base.sites[0] = None
+        elif current is not None and current is not plate:
+            try:
+                base.unassign_child_resource(current)
+            except Exception:
+                _clear_site_if_current(base, current)
+        parent = getattr(plate, "parent", None)
+        if parent is not None:
+            try:
+                parent.unassign_child_resource(plate)
+            except Exception:
+                _clear_site_if_current(parent, plate)
+        base[0] = plate
+        return getattr(plate, "parent", None) is base
+
+    def _place_synthesis_base_plate_combo(warehouse, idx, current_resource, incoming_resource, wh_name, slot_key):
+        if _is_synthesis_base(current_resource) and _is_synthesis_plate(incoming_resource):
+            assigned = _assign_plate_to_synthesis_base(current_resource, incoming_resource)
+            if assigned:
+                logger.info(
+                    f"✅ 96孔固相合成板 {incoming_resource.name} 挂载到 "
+                    f"{current_resource.name} 的槽位 A1，外部库位保持为底座 "
+                    f"{wh_name}[{idx}]{f'({slot_key})' if slot_key else ''}"
+                )
+            return assigned
+
+        if _is_synthesis_plate(current_resource) and _is_synthesis_base(incoming_resource):
+            try:
+                warehouse.unassign_child_resource(current_resource)
+            except Exception:
+                _clear_site_if_current(warehouse, current_resource)
+            warehouse[idx] = incoming_resource
+            assigned = _assign_plate_to_synthesis_base(incoming_resource, current_resource)
+            if assigned:
+                logger.info(
+                    f"✅ 96孔固相合成板底座 {incoming_resource.name} 占用 "
+                    f"{wh_name}[{idx}]{f'({slot_key})' if slot_key else ''}，"
+                    f"并挂载原固相合成板 {current_resource.name}"
+                )
+            return assigned
+
+        return False
 
     # 用于跟踪同名物料的计数器
     name_counter = {}
 
+    def _material_display_name(material):
+        return _clean_mapping_key(
+            material.get("name")
+            or material.get("materialName")
+            or material.get("material_name")
+        ) or ""
+
+    def _material_code(material):
+        return _clean_mapping_key(
+            material.get("code")
+            or material.get("materialCode")
+            or material.get("material_code")
+            or material.get("barCode")
+        ) or ""
+
+    def _internal_material_name(material):
+        base_name = _material_display_name(material)
+        code = _material_code(material)
+        if not code:
+            return base_name
+        suffix = code.split("-", 1)[1] if "-" in code else code
+        suffix = suffix.strip()
+        return f"{base_name}-{suffix}" if suffix and base_name else (base_name or suffix)
+
+    def _resolved_type_name(class_name, material):
+        if class_name == "RegularContainer":
+            return "RegularContainer"
+        raw_type_name = _clean_mapping_key(material.get("typeName") or material.get("materialTypeName")) or ""
+        try:
+            from bioyond_peptide_station.resources import peptide_materials
+
+            resource_cls = peptide_materials.get_material_class_by_type_code(_material_type_code(material))
+            if resource_cls is not None:
+                return (
+                    getattr(resource_cls, "bioyond_material_type_name", None)
+                    or raw_type_name
+                    or class_name
+                )
+        except Exception:
+            pass
+        return raw_type_name or class_name
+
     for material in bioyond_materials:
-        # 从反向映射中查找: typeName(显示名称) -> (model, UUID)
-        type_info = reverse_type_mapping.get(material.get("typeName"))
-        className = type_info[0] if type_info else "RegularContainer"
+        # 类型锚定使用 code/materialCode 前缀；缺码或未知码时退回 RegularContainer，
+        # 不使用显示名或物料名猜测成具体类型。
+        type_info, type_source, type_value = _resolve_material_type(material)
+        className = type_info[0]
+        fallback_warning = ""
+        if className == "RegularContainer":
+            fallback_warning = (
+                "missing_material_code_fallback_regular_container"
+                if type_source == "regular_container_missing_code"
+                else f"unmapped_material_type_code_fallback_regular_container:{type_value}"
+            )
+            logger.warning(
+                "[物料类型映射] Bioyond 物料退回 RegularContainer: "
+                f"id={material.get('id') or material.get('materialId')!r}, "
+                f"name={_material_display_name(material)!r}, "
+                f"typeName={material.get('typeName') or material.get('materialTypeName')!r}, "
+                f"code={material.get('code') or material.get('materialCode')!r}, "
+                f"reason={fallback_warning}"
+            )
 
-        # 为同名物料添加唯一后缀
-        base_name = material["name"]
-        if base_name in name_counter:
-            name_counter[base_name] += 1
-            unique_name = f"{base_name}_{name_counter[base_name]}"
+        # 内部资源名必须唯一，使用 Bioyond 显示名 + 物料编码尾缀；展示仍用原始名。
+        base_name = _internal_material_name(material)
+        next_index = name_counter.get(base_name, 1)
+        unique_name = base_name if next_index == 1 else f"{base_name}_{next_index}"
+        while unique_name in existing_names:
+            next_index += 1
+            unique_name = f"{base_name}_{next_index}"
+        name_counter[base_name] = next_index + 1
+        existing_names.add(unique_name)
+
+        if className == "RegularContainer":
+            plr_material_result = RegularContainer(name=unique_name)
         else:
-            name_counter[base_name] = 1
-            unique_name = base_name
-
-        plr_material_result = initialize_resource(
-            {"name": unique_name, "class": className}, resource_type=ResourcePLR
-        )
+            plr_material_result = initialize_resource(
+                {"name": unique_name, "class": className}, resource_type=ResourcePLR
+            )
 
         # initialize_resource 可能返回列表或单个对象
         if isinstance(plr_material_result, list):
             if len(plr_material_result) == 0:
-                logger.warning(f"物料 {material['name']} 初始化失败，跳过")
+                logger.warning(f"物料 {_material_display_name(material)} 初始化失败，跳过")
                 continue
             plr_material = plr_material_result[0]
         else:
@@ -102,27 +473,84 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
             logger.warning(f"物料 {unique_name} 不是有效的 ResourcePLR 实例，类型: {type(plr_material)}")
             continue
 
-        plr_material.code = material.get("barCode") or material.get("code") or ""
+        material_code = _material_code(material)
+        material_id = material.get("id") or material.get("materialId")
+        raw_name = _material_display_name(material)
+        type_code = _material_type_code(material) or ""
+        resolved_type_name = _resolved_type_name(className, material)
+        locations = copy.deepcopy(material.get("locations") or [])
+        details = copy.deepcopy(material.get("detail") or material.get("details") or [])
+        plr_material.code = material.get("barCode") or material_code
         plr_material.unilabos_uuid = str(uuid.uuid4())
 
         # ⭐ 保存 Bioyond 原始信息到 unilabos_extra（用于出库时查询）
-        plr_material.unilabos_extra = {
-            "material_bioyond_id": material.get("id"),           # Bioyond 物料 UUID
-            "material_bioyond_name": material.get("name"),       # Bioyond 原始名称（如 "MDA"）
-            "material_bioyond_type": material.get("typeName"),   # Bioyond 物料类型名称
+        # 构造器可能已写入前端展示/位姿元数据，保留后再覆盖 Bioyond 同名字段。
+        existing_extra = dict(getattr(plr_material, "unilabos_extra", {}) or {})
+        bioyond_extra = {
+            "material_bioyond_id": material_id,                  # Bioyond 物料 UUID
+            "material_bioyond_name": raw_name,                   # Bioyond 原始名称（如 "MDA"）
+            "material_bioyond_type": material.get("typeName") or material.get("materialTypeName"),
+            "material_bioyond_code": material_code,
+            "bioyond_material_type_code": type_code,
+            "bioyond_resolved_type_name": resolved_type_name,
+            "bioyond_material_locations": locations,
+            "bioyond_regular_container_fallback": className == "RegularContainer",
+            "bioyond_material_warnings": (
+                list(material.get("_bioyond_material_warnings") or [])
+                + ([fallback_warning] if fallback_warning and fallback_warning not in (material.get("_bioyond_material_warnings") or []) else [])
+            ),
+            "bioyond_material": {
+                "bioyond_id": material_id,
+                "raw_name": raw_name,
+                "display_name": raw_name,
+                "code": material_code,
+                "material_code": material_code,
+                "type_code": type_code,
+                "type_id": material.get("typeId") or material.get("materialTypeId"),
+                "raw_type_name": material.get("typeName") or material.get("materialTypeName"),
+                "resolved_type_name": resolved_type_name,
+                "resolved_resource_id": className,
+                "locations": locations,
+                "details": details,
+                "combinedMaterialId": material.get("combinedMaterialId"),
+                "parameters": copy.deepcopy(material.get("parameters") or material.get("materialParams")),
+                "status": material.get("status"),
+                "quantity": material.get("quantity"),
+                "lockQuantity": material.get("lockQuantity"),
+                "unit": material.get("unit"),
+                "raw_payload": copy.deepcopy(material),
+                "regular_container_fallback": className == "RegularContainer",
+                "fallback_reason": (
+                    material.get("_bioyond_regular_container_reason")
+                    or ("missing_material_code" if type_source == "regular_container_missing_code" else "")
+                    or (f"unmapped_material_type_code:{type_value}" if type_source == "regular_container_unmapped_code" else "")
+                ),
+            },
         }
+        existing_extra.update(bioyond_extra)
+        plr_material.unilabos_extra = existing_extra
 
-        logger.debug(f"[转换物料] {material['name']} (ID:{material['id']}) → {unique_name} (类型:{className})")
+        logger.debug(
+            f"[转换物料] {raw_name} (ID:{material.get('id')}) → {unique_name} "
+            f"(类型:{className}, 来源:{type_source}={type_value})"
+        )
 
         # 处理子物料（detail）
         if material.get("detail") and len(material["detail"]) > 0:
-            for bottle in reversed(plr_material.children):
-                plr_material.unassign_child_resource(bottle)
+            has_itemized_children = (
+                hasattr(plr_material, "get_item")
+                and hasattr(plr_material, "num_items")
+                and len(getattr(plr_material, "children", []) or []) > 0
+            )
+            if not has_itemized_children:
+                for bottle in reversed(plr_material.children):
+                    plr_material.unassign_child_resource(bottle)
             child_ids = []
 
             # 确定detail物料的默认类型
             # 样品板的detail通常是样品瓶
-            default_detail_type = "样品瓶" if "样品板" in material.get("typeName", "") else None
+            parent_type_name = str(material.get("typeName") or material.get("materialTypeName") or "")
+            default_detail_type = "样品瓶" if "样品板" in parent_type_name else None
 
             for detail in material["detail"]:
                 number = (
@@ -132,7 +560,10 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
                 )
 
                 # 检查索引是否超出范围
-                max_index = plr_material.num_items_x * plr_material.num_items_y - 1
+                if has_itemized_children:
+                    max_index = len(plr_material.children) - 1
+                else:
+                    max_index = plr_material.num_items_x * plr_material.num_items_y - 1
                 if number < 0 or number > max_index:
                     logger.warning(
                         f"  └─ [子物料警告] {detail['name']} 的坐标 (x={detail.get('x')}, y={detail.get('y')}, z={detail.get('z')}) "
@@ -145,7 +576,7 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
 
                 # 如果没有typeName，尝试根据父物料类型和位置推断
                 if not typeName:
-                    if "分装板" in material.get("typeName", ""):
+                    if "分装板" in parent_type_name:
                         # 分装板: 根据行(x)判断类型
                         # 第一行(x=1)是10%分装小瓶，第二行(x=2)是90%分装小瓶
                         x_pos = detail.get("x", 0)
@@ -158,6 +589,22 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
                         # logger.debug(f"  └─ [推断结果] {detail['name']} → {typeName}")
                     else:
                         typeName = default_detail_type
+
+                if has_itemized_children:
+                    target_items = plr_material[number]
+                    target = target_items[0] if target_items else None
+                    if target is not None:
+                        if hasattr(target, "tracker"):
+                            target.tracker.liquids = [
+                                (detail["name"], float(detail.get("quantity", 0)) if detail.get("quantity") else 0)
+                            ]
+                        if detail.get("code"):
+                            target.code = detail.get("code", "")
+                        logger.debug(
+                            f"  └─ [子物料] {detail['name']} → {plr_material.name}[{number}] "
+                            f"(保留默认孔位/储液槽，类型:{typeName})"
+                        )
+                    continue
 
                 if typeName and typeName in reverse_type_mapping:
                     bottle = plr_material[number] = initialize_resource(
@@ -173,12 +620,62 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
         else:
             # 只对有 capacity 属性的容器（液体容器）处理液体追踪
             if hasattr(plr_material, 'capacity'):
-                bottle = plr_material[0] if plr_material.capacity > 0 else plr_material
-                bottle.tracker.liquids = [
-                    (material["name"], float(material.get("quantity", 0)) if material.get("quantity") else 0)
-                ]
+                liquid_target = None
+                if hasattr(plr_material, "tracker"):
+                    liquid_target = plr_material
+                elif plr_material.capacity > 0:
+                    candidate = plr_material[0]
+                    if hasattr(candidate, "tracker"):
+                        liquid_target = candidate
+
+                if liquid_target is not None:
+                    liquid_target.tracker.liquids = [
+                        (raw_name, float(material.get("quantity", 0)) if material.get("quantity") else 0)
+                    ]
+                else:
+                    logger.debug(
+                        f"物料 {unique_name} 类型 {type(plr_material).__name__} 没有液体 tracker，跳过液体追踪"
+                    )
 
         plr_materials.append(plr_material)
+        material_bioyond_id = _resource_bioyond_id(plr_material)
+        if material_bioyond_id:
+            resources_by_bioyond_id[material_bioyond_id] = plr_material
+        _try_attach_combined_children()
+
+        combined_parent_id = _combined_parent_id(material)
+        if combined_parent_id:
+            child_location_key = _first_location_key_from_locations(locations)
+            parent = resources_by_bioyond_id.get(combined_parent_id)
+            if parent is not None:
+                parent_location_key = _first_location_key_from_resource(parent)
+                if child_location_key is None or child_location_key == parent_location_key:
+                    if _assign_child_to_parent_slot(parent, plr_material):
+                        logger.info(
+                            f"[组合物料] 物料 {unique_name} 按 combinedMaterialId={combined_parent_id} "
+                            f"挂载到父物料 {getattr(parent, 'name', None)}，跳过自身 locations[] 放置"
+                        )
+                        continue
+                else:
+                    logger.debug(
+                        f"[组合物料] 物料 {unique_name} combinedMaterialId={combined_parent_id} "
+                        f"但自身位置 {child_location_key} 不同于父物料位置 {parent_location_key}，"
+                        "继续按自身 locations[] 放置"
+                    )
+            elif child_location_key is None:
+                pending_combined_children.append((combined_parent_id, plr_material, child_location_key, False))
+                _try_attach_combined_children()
+                if getattr(plr_material, "parent", None) is None:
+                    logger.warning(
+                        f"[组合物料] 物料 {unique_name} 声明 combinedMaterialId={combined_parent_id} "
+                        "且没有 locations[]，等待父物料出现后挂载"
+                    )
+                continue
+            else:
+                pending_combined_children.append((combined_parent_id, plr_material, child_location_key, True))
+                _try_attach_combined_children()
+                if getattr(plr_material, "parent", None) is not None:
+                    continue
 
         if deck and hasattr(deck, "warehouses"):
             locations = material.get("locations", [])
@@ -214,7 +711,7 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
                     elif 5 <= x_val <= 8:
                         wh_name = "堆栈1右"
                     else:
-                        logger.warning(f"物料 {material['name']} 的列号 x={x_val} 超出范围，无法映射到堆栈1左或堆栈1右")
+                        logger.warning(f"物料 {raw_name} 的列号 x={x_val} 超出范围，无法映射到堆栈1左或堆栈1右")
                         continue
 
                 # 特殊处理: Bioyond的"站内Tip盒堆栈"也需要进行拆分映射
@@ -224,7 +721,8 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
                         wh_name = "站内Tip盒堆栈(右)"
                     elif y_val in [2, 3]:
                         wh_name = "站内Tip盒堆栈(左)"
-                        y = y - 1  # 调整列号，因为左侧仓库对应的 Bioyond y=2 实际上是它的第1列
+                        loc = dict(loc)
+                        loc["y"] = y_val - 1  # 左侧仓库 Bioyond y=2 对应第1列
 
                 if hasattr(deck, "warehouses") and wh_name in deck.warehouses:
                     warehouse = deck.warehouses[wh_name]
@@ -306,6 +804,7 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
                                     f"⚠️ 物料 {unique_name} 覆盖 {wh_name}[{idx}]"
                                     f"{f'({slot_key})' if slot_key else ''} 的旧占位 occupied_by={current_resource!r}"
                                 )
+                                warehouse.sites[idx] = None
                             # 物料尺寸已在放入warehouse前根据需要进行了交换
                             warehouse[idx] = plr_material
                             logger.debug(
@@ -314,6 +813,15 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
                                 f"(Bioyond坐标: x={loc.get('x')}, y={loc.get('y')})"
                             )
                         else:
+                            if _place_synthesis_base_plate_combo(
+                                warehouse,
+                                idx,
+                                current_resource,
+                                plr_material,
+                                wh_name,
+                                slot_key,
+                            ):
+                                continue
                             parent = getattr(current_resource, "parent", None)
                             current_repr = repr(current_resource)
                             current_len = len(current_resource) if isinstance(current_resource, str) else None
@@ -331,6 +839,19 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
                 else:
                     if wh_name:
                         logger.warning(f"❌ 物料 {unique_name} 的warehouse '{wh_name}' 在deck中不存在。可用warehouses: {list(deck.warehouses.keys()) if hasattr(deck, 'warehouses') else '无'}")
+
+    _try_attach_combined_children()
+    for parent_id, child, _child_location_key, placed_by_location in pending_combined_children:
+        if placed_by_location:
+            logger.warning(
+                f"[组合物料] 子物料 {getattr(child, 'name', None)} 的父物料 "
+                f"combinedMaterialId={parent_id} 未找到，已保留自身 locations[] 放置结果"
+            )
+        else:
+            logger.warning(
+                f"[组合物料] 子物料 {getattr(child, 'name', None)} 的父物料 "
+                f"combinedMaterialId={parent_id} 未找到，且子物料没有 locations[]，未放置到 deck"
+            )
 
     return plr_materials
 

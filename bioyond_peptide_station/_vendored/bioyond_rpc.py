@@ -117,7 +117,11 @@ class BioyondV1RPC(BaseRequest):
                 self.location_mapping.update(warehouse_config["site_uuids"])
         self._logger = SimpleLogger()
         self.material_cache = {}
-        self._load_material_cache()
+        self.bioyond_material_cache = {}
+        if self.config.get("load_material_cache_on_init", True):
+            self._load_material_cache()
+        else:
+            print("跳过启动阶段材料列表缓存加载")
 
     # ==================== 基础通用方法 ====================
 

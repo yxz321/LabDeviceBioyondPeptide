@@ -154,20 +154,6 @@ ORDER_STATUS_VALUE_MAP: Dict[str, str] = {
     "60": "60",
     "100": "100",
 }
-ErrorHandlingChoice = Literal["retry", "skip", "end_experiment"]
-ERROR_HANDLING_CHOICE_TO_OPTION: Dict[str, int] = {
-    "retry": 1,
-    "skip": 2,
-    "end_experiment": 5,
-}
-ERROR_HANDLING_AVAILABLE_OPTIONS: Tuple[Dict[str, Any], ...] = (
-    {"choice": "retry", "bioyond_option": 1, "label": "Retry"},
-    {"choice": "skip", "bioyond_option": 2, "label": "Skip"},
-    {"choice": "end_experiment", "bioyond_option": 5, "label": "End experiment"},
-)
-DEFAULT_ERROR_HANDLING_IGNORE_TEXTS: Tuple[str, ...] = (
-    "Executor LabelPrinterA failed while running BY_Print.",
-)
 MATERIAL_TYPE_ORDER = ("Sample", "Consumables", "Reagent")
 PEPTIDE_SAMPLE_FILE_KEY = "SampleFile"
 DAY1_CEM_METHOD_KEY = "CEMMethodFileName"
@@ -194,23 +180,9 @@ class PeptideWorkflowError(RuntimeError):
     """多肽工作流可恢复错误。"""
 
 
-def build_scheduler_error_handling_reply_data(
-    error_report: Dict[str, Any],
-    reply_option: int,
-    *,
-    creation_time: Optional[str] = None,
-) -> Dict[str, Any]:
-    """懒加载 Bioyond RPC 构造器，避免导入工作站模块时强依赖运行时通信栈。"""
-    from bioyond_peptide_station._vendored.bioyond_rpc import (
-        build_scheduler_error_handling_reply_data as _build_reply_data,
-    )
-
-    return _build_reply_data(error_report, reply_option, creation_time=creation_time)
-
-
 class PeptideCommonSubmitOptionalParams(TypedDict, total=False):
     order_name: Annotated[str, Field(description="订单名称；为空时自动生成，用户可覆盖。")]
-    auto_register_materials: Annotated[bool, Field(default=True, description="是否自动登记返回的物料信息；默认勾选。本轮仅回传开关，不修改资源树。")]
+    auto_register_materials: Annotated[bool, Field(default=True, description="是否自动按订单ID查询并缓存返回的物料信息；默认勾选，不做全量库存同步。")]
     parameter_overrides: Annotated[
         List[Dict[str, Any]],
         Field(
@@ -382,13 +354,56 @@ class BioyondPeptideStation(BioyondWorkstation):
         # - order_finish_event 用于阻塞等待 + 唤醒 wait_for_order_finish 动作
         self.order_finish_event = threading.Event()
         self.last_order_code: Optional[str] = None
+        self.last_order_id: Optional[str] = None
         self.last_order_report: Optional[Dict[str, Any]] = None
+        self.last_order_material_sync: Optional[Dict[str, Any]] = None
         self.last_used_materials: List[Any] = []
-        self.error_handling_event = threading.Event()
-        self.error_handling_lock = threading.Lock()
-        self.error_queue: List[Dict[str, Any]] = []
-        self.error_in_flight: Dict[str, Dict[str, Any]] = {}
         logger.info("BioyondPeptideStation 初始化完成: %s", self.bioyond_config.get("api_host", ""))
+
+    @action(always_free=True, description="从 Bioyond 全量同步物料并发布资源树")
+    def sync_materials_from_bioyond(
+        self,
+        publish_tree: bool = True,
+        clear_stale: bool = False,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """从 Bioyond 库存接口全量同步物料。
+
+        Args:
+            publish_tree: 同步成功后是否发布整棵 deck 资源树到 UniLabOS。
+            clear_stale: 是否清理本次库存快照未出现的旧物料；默认不清理。
+        """
+        del kwargs
+        synchronizer = getattr(self, "resource_synchronizer", None)
+        if synchronizer is None or not hasattr(synchronizer, "sync_from_external"):
+            logger.warning("[sync_materials_from_bioyond] 资源同步器未初始化")
+            return {
+                "success": False,
+                "action": "sync_materials_from_bioyond",
+                "message": "资源同步器未初始化或不支持 sync_from_external",
+                "published": False,
+            }
+
+        with self._debug_call_session("sync_materials_from_bioyond"):
+            synced = bool(synchronizer.sync_from_external(clear_stale=bool(clear_stale)))
+        sync_result = dict(getattr(synchronizer, "last_sync_result", {}) or {})
+        published = False
+        if synced and publish_tree:
+            publisher = getattr(self, "_publish_material_tree_update", None)
+            if callable(publisher):
+                published = bool(publisher("manual_full_sync"))
+            else:
+                logger.warning("[sync_materials_from_bioyond] 资源树发布接口不可用")
+
+        return {
+            "success": synced,
+            "action": "sync_materials_from_bioyond",
+            "message": "Bioyond 物料全量同步完成" if synced else "Bioyond 物料全量同步失败",
+            "published": published,
+            "publish_requested": bool(publish_tree),
+            "clear_stale": bool(clear_stale),
+            "sync_result": sync_result,
+        }
 
     def _debug_call_session(self, action_name: str):
         parent_debug_session = getattr(super(), "_debug_call_session", None)
@@ -397,7 +412,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         return nullcontext()
 
     def handle_external_error(self, error_data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理奔曜错误报送，并排队等待人工选择回复。"""
+        """处理奔曜错误报送，并为后续 SSE 人工选择回复预留上下文。"""
         parent_handler = getattr(super(), "handle_external_error", None)
         if parent_handler is not None:
             base_result = parent_handler(error_data)
@@ -407,478 +422,26 @@ class BioyondPeptideStation(BioyondWorkstation):
                 "error_type": "bioyond_error" if isinstance(error_data, dict) and "code" in error_data else "unknown",
                 "timestamp": datetime.now().isoformat(),
             }
-        if not isinstance(error_data, dict) or not (error_data.get("ijk") and error_data.get("token")):
+        if not isinstance(error_data, dict) or not any(
+            error_data.get(key) for key in ("ijk", "token", "optionMessage")
+        ):
             return base_result
 
-        self._ensure_error_handling_state()
-        token = str(error_data.get("token") or "").strip()
-        item = {
-            "token": token,
-            "received_at": datetime.now(timezone.utc).isoformat(),
-            "error_report": dict(error_data),
-            "status": "pending",
-            "base_result": base_result,
-        }
-        with self.error_handling_lock:
-            self.error_queue.append(item)
-            queued_count = len(self.error_queue)
-            self.error_handling_event.set()
-
-        logger.error(
-            "[peptide] 奔曜调度错误已入队: token=%s task=%s code=%s queue=%s",
-            token,
-            error_data.get("task"),
-            error_data.get("code"),
-            queued_count,
-        )
         result = dict(base_result) if isinstance(base_result, dict) else {"base_result": base_result}
         result.update(
             {
-                "reply_status": "pending_manual_confirm",
-                "token": token,
-                "queued_error_count": queued_count,
+                "reply_status": "pending_sse_option",
+                "error_reply_context": {
+                    "ijk": error_data.get("ijk"),
+                    "token": error_data.get("token"),
+                    "optionMessage": error_data.get("optionMessage"),
+                },
             }
         )
+        # TODO: 待错误 SSE/人工确认工具提供 reply_option 后，调用
+        # build_scheduler_error_handling_reply_data(error_data, reply_option)，
+        # 再通过 self._require_hardware_interface().scheduler_reply_error_handling(reply_data) 回复奔曜。
         return result
-
-    def _ensure_error_handling_state(self) -> None:
-        """兼容 object.__new__ 构造的离线测试实例。"""
-        if getattr(self, "error_handling_event", None) is None:
-            self.error_handling_event = threading.Event()
-        if getattr(self, "error_handling_lock", None) is None:
-            self.error_handling_lock = threading.Lock()
-        if not isinstance(getattr(self, "error_queue", None), list):
-            self.error_queue = []
-        if not isinstance(getattr(self, "error_in_flight", None), dict):
-            self.error_in_flight = {}
-
-    def _refresh_error_handling_event_locked(self) -> None:
-        if self.error_queue:
-            self.error_handling_event.set()
-        else:
-            self.error_handling_event.clear()
-
-    def _error_handling_token_from_report(self, error_report: Optional[Dict[str, Any]]) -> str:
-        if not isinstance(error_report, dict):
-            return ""
-        return str(error_report.get("token") or "").strip()
-
-    def _error_handling_token_from_item(self, item: Dict[str, Any]) -> str:
-        token = str(item.get("token") or "").strip()
-        if token:
-            return token
-        return self._error_handling_token_from_report(dict(item.get("error_report") or {}))
-
-    def _claim_next_error_handling_item(self) -> Optional[Dict[str, Any]]:
-        self._ensure_error_handling_state()
-        with self.error_handling_lock:
-            if not self.error_queue:
-                self.error_handling_event.clear()
-                return None
-            item = self.error_queue.pop(0)
-            item["status"] = "claimed"
-            self._refresh_error_handling_event_locked()
-            remaining = len(self.error_queue)
-        logger.info(
-            "[peptide] wait_for_error_handling 领取错误: token=%s remaining_queue=%s",
-            self._error_handling_token_from_item(item),
-            remaining,
-        )
-        return item
-
-    def _claim_error_handling_item_by_token(self, token: str) -> Optional[Dict[str, Any]]:
-        self._ensure_error_handling_state()
-        normalized_token = str(token or "").strip()
-        if not normalized_token:
-            return None
-        with self.error_handling_lock:
-            item = self.error_in_flight.get(normalized_token)
-            if item is not None:
-                return item
-            for index, queued_item in enumerate(self.error_queue):
-                if self._error_handling_token_from_item(queued_item) == normalized_token:
-                    item = self.error_queue.pop(index)
-                    item["status"] = "claimed_for_reply"
-                    self._refresh_error_handling_event_locked()
-                    return item
-        return None
-
-    def _store_error_handling_in_flight(self, item: Dict[str, Any], status: str = "in_flight") -> None:
-        self._ensure_error_handling_state()
-        item["status"] = status
-        token = self._error_handling_token_from_item(item)
-        if not token:
-            raise ValueError("error_handling item 缺少 token")
-        item["token"] = token
-        with self.error_handling_lock:
-            self.error_in_flight[token] = item
-
-    def _normalize_error_ignore_texts(self, ignore_errors_with: Optional[List[str]]) -> List[str]:
-        raw_values: Iterable[Any]
-        if ignore_errors_with is None:
-            raw_values = DEFAULT_ERROR_HANDLING_IGNORE_TEXTS
-        elif isinstance(ignore_errors_with, str):
-            raw_values = [ignore_errors_with]
-        else:
-            raw_values = ignore_errors_with
-        normalized: List[str] = []
-        for item in raw_values:
-            text = str(item or "").strip()
-            if text:
-                normalized.append(text)
-        return normalized
-
-    def _match_ignored_error_text(self, error_report: Dict[str, Any], ignore_texts: List[str]) -> Optional[str]:
-        err_inner_message = str(error_report.get("errInnerMessage") or "")
-        for ignore_text in ignore_texts:
-            if ignore_text and ignore_text in err_inner_message:
-                return ignore_text
-        return None
-
-    def _error_handling_message(self, error_report: Dict[str, Any]) -> str:
-        parts: List[str] = []
-        for key in ("errMessage", "errInnerMessage", "errInnerMessage2", "errInnerMessage3"):
-            value = str(error_report.get(key) or "").strip()
-            if value:
-                parts.append(value)
-        return "\n".join(parts)
-
-    def _error_handling_confirmation_message(self, error_report: Dict[str, Any]) -> str:
-        task = str(error_report.get("task") or "unknown").strip()
-        code = str(error_report.get("code") or "unknown").strip()
-        message = self._error_handling_message(error_report) or "未提供错误详情"
-        return f"奔曜调度错误待处理: task={task}, code={code}\n{message}"
-
-    def _format_error_handling_wait_result(
-        self,
-        item: Dict[str, Any],
-        *,
-        auto_handled_errors: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        error_report = dict(item.get("error_report") or {})
-        token = self._error_handling_token_from_item(item)
-        return {
-            "success": True,
-            "error_handling_status": "received",
-            "requires_manual_reply": True,
-            "token": token,
-            "error_report": error_report,
-            "task": error_report.get("task"),
-            "code": error_report.get("code"),
-            "error_message": self._error_handling_message(error_report),
-            "optionMessage": error_report.get("optionMessage"),
-            "available_options": [dict(item) for item in ERROR_HANDLING_AVAILABLE_OPTIONS],
-            "auto_handled_errors": list(auto_handled_errors or []),
-            "confirmation_message": self._error_handling_confirmation_message(error_report),
-        }
-
-    def _format_error_handling_timeout_result(
-        self,
-        auto_handled_errors: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        return {
-            "success": False,
-            "error_handling_status": "timeout",
-            "requires_manual_reply": False,
-            "token": "",
-            "error_report": {},
-            "task": None,
-            "code": None,
-            "error_message": "",
-            "optionMessage": None,
-            "available_options": [dict(item) for item in ERROR_HANDLING_AVAILABLE_OPTIONS],
-            "auto_handled_errors": list(auto_handled_errors or []),
-            "confirmation_message": "等待奔曜错误处理报送超时",
-        }
-
-    def _reply_scheduler_error_handling(self, error_report: Dict[str, Any], reply_option: int) -> Tuple[int, Dict[str, Any]]:
-        reply_data = build_scheduler_error_handling_reply_data(error_report, reply_option)
-        rpc = self._require_hardware_interface("scheduler_reply_error_handling")
-        result_code = rpc.scheduler_reply_error_handling(reply_data)
-        return int(result_code or 0), reply_data
-
-    def _auto_skip_error_handling_item(
-        self,
-        item: Dict[str, Any],
-        matched_ignore_text: str,
-    ) -> Tuple[bool, Dict[str, Any]]:
-        error_report = dict(item.get("error_report") or {})
-        token = self._error_handling_token_from_item(item)
-        summary: Dict[str, Any] = {
-            "token": token,
-            "matched_ignore_text": matched_ignore_text,
-            "reply_option": 2,
-            "reply_result": 0,
-        }
-        try:
-            result_code, reply_data = self._reply_scheduler_error_handling(error_report, 2)
-            summary["reply_result"] = result_code
-            summary["reply_data"] = reply_data
-        except Exception as exc:
-            item["reply_failure"] = str(exc)
-            summary["error"] = str(exc)
-            self._store_error_handling_in_flight(item, status="auto_skip_failed")
-            logger.error(
-                "[peptide] 错误 %s 自动 skip 回复失败，保留人工处理: %s",
-                token,
-                exc,
-                exc_info=True,
-            )
-            return False, summary
-
-        if result_code == 1:
-            item["status"] = "auto_skipped"
-            logger.warning(
-                "[peptide] 错误 %s automatically handled by skip: 命中忽略规则 %s; errInnerMessage=%s; reply_result=%s",
-                token,
-                matched_ignore_text,
-                error_report.get("errInnerMessage"),
-                result_code,
-            )
-            return True, summary
-
-        item["reply_failure"] = f"scheduler_reply_error_handling 返回 {result_code}"
-        self._store_error_handling_in_flight(item, status="auto_skip_failed")
-        logger.error(
-            "[peptide] 错误 %s 自动 skip 回复失败，返回码=%s，保留人工处理",
-            token,
-            result_code,
-        )
-        return False, summary
-
-    @action(
-        always_free=True,
-        goal_default={
-            "timeout_seconds": 36000,
-            "poll_mode": True,
-            "poll_interval_seconds": 0.5,
-            "ignore_errors_with": ["Executor LabelPrinterA failed while running BY_Print."],
-        },
-        description="等待奔曜 /report/error_handling 推送，并把未自动跳过的错误交给人工处理节点",
-        handles=[
-            ActionOutputHandle(key="available_options", data_type="array", label="可选处理方式", data_key="available_options", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(key="token", data_type="str", label="错误Token", data_key="token", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(key="error_report", data_type="object", label="错误报送内容", data_key="error_report", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(key="error_message", data_type="str", label="错误信息", data_key="error_message", data_source=DataSource.EXECUTOR),
-        ],
-    )
-    def wait_for_error_handling2(
-        self,
-        timeout_seconds: int = 36000,
-        poll_mode: bool = True,
-        poll_interval_seconds: float = 0.5,
-        ignore_errors_with: Optional[List[str]] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """等待奔曜调度错误，默认自动 skip 已知可忽略的打标机错误。"""
-        del kwargs
-        self._ensure_error_handling_state()
-        ignore_texts = self._normalize_error_ignore_texts(ignore_errors_with)
-        auto_handled_errors: List[Dict[str, Any]] = []
-        timeout_effective: Optional[float] = float(timeout_seconds) if timeout_seconds and timeout_seconds > 0 else None
-        deadline = (time.monotonic() + timeout_effective) if timeout_effective is not None else None
-
-        with self._debug_call_session("wait_for_error_handling"):
-            while True:
-                candidate = self._claim_next_error_handling_item()
-                if candidate is not None:
-                    error_report = dict(candidate.get("error_report") or {})
-                    matched_ignore_text = self._match_ignored_error_text(error_report, ignore_texts)
-                    if matched_ignore_text:
-                        auto_skipped, summary = self._auto_skip_error_handling_item(candidate, matched_ignore_text)
-                        auto_handled_errors.append(summary)
-                        if auto_skipped:
-                            continue
-                        return self._format_error_handling_wait_result(
-                            candidate,
-                            auto_handled_errors=auto_handled_errors,
-                        )
-
-                    self._store_error_handling_in_flight(candidate, status="in_flight")
-                    return self._format_error_handling_wait_result(
-                        candidate,
-                        auto_handled_errors=auto_handled_errors,
-                    )
-
-                if deadline is None:
-                    wait_timeout: Optional[float] = max(float(poll_interval_seconds or 0.5), 0.001) if poll_mode else None
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        logger.warning("[peptide] wait_for_error_handling 超时")
-                        return self._format_error_handling_timeout_result(auto_handled_errors)
-                    wait_timeout = min(max(float(poll_interval_seconds or 0.5), 0.001), remaining) if poll_mode else remaining
-
-                triggered = self.error_handling_event.wait(timeout=wait_timeout)
-                if not triggered and not poll_mode and deadline is not None:
-                    logger.warning("[peptide] wait_for_error_handling 超时")
-                    return self._format_error_handling_timeout_result(auto_handled_errors)
-
-    @action(
-        always_free=True,
-        node_type=NodeType.MANUAL_CONFIRM,
-        placeholder_keys={"assignee_user_ids": "unilabos_manual_confirm"},
-        goal_default={
-            "reply_choice": "retry",
-            "error_message": "",
-            "timeout_seconds": 3600,
-            "assignee_user_ids": [],
-        },
-        feedback_interval=300,
-        description="选择 retry / skip / end_experiment 后回复奔曜调度错误处理接口",
-        handles=[
-            ActionInputHandle(key="token", data_type="str", label="错误Token", data_key="token", data_source=DataSource.HANDLE, io_type="source"),
-            ActionInputHandle(key="error_report", data_type="object", label="错误报送内容", data_key="error_report", data_source=DataSource.HANDLE, io_type="source"),
-            ActionInputHandle(key="error_message", data_type="text", label="错误信息", data_key="error_message", data_source=DataSource.HANDLE, io_type="source"),
-        ],
-    )
-    def reply_error_handling2(
-        self,
-        token: str = "",
-        error_report: Optional[Dict[str, Any]] = None,
-        reply_choice: Literal["retry", "skip", "end_experiment"] = "retry",
-        error_message: str = "",
-        timeout_seconds: int = 3600,
-        assignee_user_ids: Optional[List[str]] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """人工确认后向奔曜回复调度错误处理选择。"""
-        del timeout_seconds, assignee_user_ids, kwargs
-        self._ensure_error_handling_state()
-        report_arg = dict(error_report) if isinstance(error_report, dict) and error_report else {}
-        report_token = self._error_handling_token_from_report(report_arg)
-        normalized_token = str(token or "").strip() or report_token
-        normalized_choice = str(reply_choice or "").strip()
-        if normalized_choice not in ERROR_HANDLING_CHOICE_TO_OPTION:
-            return {
-                "success": False,
-                "token": normalized_token,
-                "reply_status": "invalid_choice",
-                "reply_choice": normalized_choice,
-                "available_options": [dict(item) for item in ERROR_HANDLING_AVAILABLE_OPTIONS],
-                "message": f"未知错误处理选项: {normalized_choice}",
-            }
-
-        item: Optional[Dict[str, Any]] = None
-        if normalized_token and report_token and normalized_token != report_token:
-            return {
-                "success": False,
-                "token": normalized_token,
-                "reply_status": "token_mismatch",
-                "reply_choice": normalized_choice,
-                "message": f"输入 token 与 error_report.token 不一致: {normalized_token} != {report_token}",
-            }
-
-        if normalized_token:
-            item = self._claim_error_handling_item_by_token(normalized_token)
-            if not item:
-                if report_arg:
-                    report = report_arg
-                else:
-                    return {
-                        "success": False,
-                        "token": normalized_token,
-                        "reply_status": "missing_context",
-                        "reply_choice": normalized_choice,
-                        "message": "错误处理上下文不存在或已回复，请重新等待错误处理节点",
-                    }
-            else:
-                report = dict(item.get("error_report") or report_arg)
-                normalized_token = self._error_handling_token_from_item(item)
-        elif report_arg:
-            report = report_arg
-            normalized_token = report_token
-        else:
-            return {
-                "success": False,
-                "token": "",
-                "reply_status": "missing_error_report",
-                "reply_choice": normalized_choice,
-                "message": "缺少 token 时必须提供 error_report",
-            }
-
-        if normalized_token and not self._error_handling_token_from_report(report):
-            report["token"] = normalized_token
-        aggregated_message = str(error_message or "").strip() or self._error_handling_message(report)
-        option_int = ERROR_HANDLING_CHOICE_TO_OPTION[normalized_choice]
-
-        with self._debug_call_session("reply_error_handling"):
-            try:
-                result_code, reply_data = self._reply_scheduler_error_handling(report, option_int)
-            except Exception as exc:
-                if item is not None:
-                    item["status"] = "send_failed"
-                    item["reply_failure"] = str(exc)
-                    self._store_error_handling_in_flight(item, status="send_failed")
-                logger.error(
-                    "[peptide] 错误 %s 人工回复失败: choice=%s option=%s ijk=%s token=%s error=%s",
-                    normalized_token,
-                    normalized_choice,
-                    option_int,
-                    report.get("ijk"),
-                    report.get("token"),
-                    exc,
-                    exc_info=True,
-                )
-                return {
-                    "success": False,
-                    "token": normalized_token,
-                    "reply_status": "send_failed",
-                    "reply_choice": normalized_choice,
-                    "bioyond_option": option_int,
-                    "reply_result": 0,
-                    "error": str(exc),
-                    "confirmation_message": aggregated_message,
-                }
-
-            logger.info(
-                "[peptide] 错误 %s 人工回复: choice=%s option=%s ijk=%s token=%s result=%s",
-                normalized_token,
-                normalized_choice,
-                option_int,
-                report.get("ijk"),
-                report.get("token"),
-                result_code,
-            )
-        if result_code == 1:
-            if item is not None:
-                with self.error_handling_lock:
-                    self.error_in_flight.pop(normalized_token, None)
-                    self._refresh_error_handling_event_locked()
-            return {
-                "success": True,
-                "token": normalized_token,
-                "reply_status": "sent",
-                "reply_choice": normalized_choice,
-                "bioyond_option": option_int,
-                "reply_result": result_code,
-                "reply_data": reply_data,
-                "confirmation_message": aggregated_message,
-            }
-
-        if item is not None:
-            item["status"] = "send_failed"
-            item["reply_failure"] = f"scheduler_reply_error_handling 返回 {result_code}"
-            self._store_error_handling_in_flight(item, status="send_failed")
-            with self.error_handling_lock:
-                self._refresh_error_handling_event_locked()
-        logger.error(
-            "[peptide] 错误 %s 人工回复失败: choice=%s option=%s result=%s",
-            normalized_token,
-            normalized_choice,
-            option_int,
-            result_code,
-        )
-        return {
-            "success": False,
-            "token": normalized_token,
-            "reply_status": "send_failed",
-            "reply_choice": normalized_choice,
-            "bioyond_option": option_int,
-            "reply_result": result_code,
-            "reply_data": reply_data,
-            "confirmation_message": aggregated_message,
-        }
 
     def fetch_workflow_list(
         self,
@@ -1403,9 +966,52 @@ class BioyondPeptideStation(BioyondWorkstation):
                 warnings.append("create_order_allocation_unavailable_for_result_table")
             result_table = self._build_result_table(allocation["materials_by_type"])
             auto_register = bool(optional.get("auto_register_materials", True))
-            material_registration = (
-                {"requested": True, "status": "not_implemented"} if auto_register else {"requested": False, "status": "skipped"}
+            cache_result = self._cache_order_allocation_rows(
+                allocation["allocation_rows"],
+                order_ids=order_ids,
+                source="submit_experiment",
             )
+            materials_by_order_id: List[Dict[str, Any]] = []
+            order_id_sync = {
+                "requested": bool(auto_register and order_id),
+                "status": "skipped",
+                "material_count": 0,
+            }
+            if auto_register and order_id:
+                try:
+                    material_sync = self._sync_order_materials_from_bioyond(
+                        order_id,
+                        reason="submit_experiment",
+                    )
+                    materials_by_order_id = list(material_sync.get("materials") or [])
+                    order_id_sync.update({
+                        "status": material_sync.get("status", "synced"),
+                        "material_count": len(materials_by_order_id),
+                        "deck_sync": material_sync,
+                    })
+                except Exception as exc:
+                    warning = f"materials_by_order_id_sync_failed:{exc}"
+                    warnings.append(warning)
+                    order_id_sync.update({"status": "failed", "error": str(exc)})
+                    logger.warning(
+                        f"[peptide] submit_experiment 订单物料同步失败: "
+                        f"order_id={order_id} error={exc}"
+                    )
+            material_registration = {
+                "requested": auto_register,
+                "status": (
+                    (
+                        "cached"
+                        if order_id_sync.get("status") == "cached" or cache_result.get("updated_count")
+                        else order_id_sync.get("status", "skipped")
+                    )
+                    if auto_register
+                    else "skipped"
+                ),
+                "allocation_cache": cache_result,
+                "cache": cache_result,
+                "order_id_sync": order_id_sync,
+            }
             return {
                 "success": bool(order_ids),
                 "order_id": order_id,
@@ -1420,6 +1026,7 @@ class BioyondPeptideStation(BioyondWorkstation):
                 "create_order_data_raw": create_order_raw,
                 "allocation_map": allocation["allocation_map"],
                 "allocation_rows": allocation["allocation_rows"],
+                "materials_by_order_id": materials_by_order_id,
                 "resultTable": result_table,
                 "start_experiment": {
                     "order_id": order_id,
@@ -1477,45 +1084,147 @@ class BioyondPeptideStation(BioyondWorkstation):
         report_request: Any,
         used_materials: Optional[List[Any]] = None,
     ) -> Any:
-        """Override 基类 ``/report/order_finish`` 回调，做 orderCode 匹配 + 事件触发。
+        """处理订单完成报送，按 peptide 触发矩阵发布状态/唤醒事件但不做全量库存同步。
 
-        必须先调用 ``super().process_order_finish_report()`` 以保留基类副作用（``_publish_task_status``
-        推送 ROS 任务状态、status==30 时触发 ``resource_synchronizer.sync_from_external()`` 同步物料）。
-        当推送的 ``orderCode`` 与 ``self.last_order_code`` 严格相等时 ``set()`` 事件，
-        否则仅记日志，保证多 ``wait_for_order_finish`` 节点的隔离。
+        订单范围的新鲜度与下料物料查询由 ``wait_for_order_finish`` 侧处理；后续如需更细粒度
+        的 order-scoped sync，应单独实现，避免恢复基类全量同步副作用。
         """
-        materials = list(used_materials or [])
         try:
-            base_result = super().process_order_finish_report(report_request, materials)
-        except Exception as exc:
-            # 防御性兜底：基类异常不应吞掉事件触发，否则 wait 节点永远等不到结果。
-            logger.error(
-                f"[peptide] 基类 process_order_finish_report 抛错: {exc}",
-                exc_info=True,
-            )
-            base_result = {"processed": False, "error": str(exc)}
+            materials = list(used_materials or [])
+            data = getattr(report_request, "data", None) or {}
+            status_names = {"30": "完成", "-11": "异常停止", "-12": "人工停止"}
+            status_desc = status_names.get(str(data.get("status")), f"状态{data.get('status')}")
 
-        data = getattr(report_request, "data", None) or {}
-        order_code = str(data.get("orderCode") or "")
-        status = data.get("status")
+            logger.info(f"[任务完成报送] 订单: {data.get('orderCode')} - {data.get('orderName')}")
+            logger.info(f"  状态: {status_desc}")
+            logger.info(f"  开始时间: {data.get('startTime')}")
+            logger.info(f"  结束时间: {data.get('endTime')}")
+            logger.info(f"  使用物料数量: {len(materials)}")
 
-        self.last_order_report = data
-        self.last_used_materials = materials
+            for material in materials:
+                logger.debug(
+                    f"  物料: {getattr(material, 'materialId', '')}, "
+                    f"用量: {getattr(material, 'usedQuantity', '')}"
+                )
 
-        logger.info(
-            f"[peptide] /report/order_finish 收到: orderCode={order_code} status={status} "
-            f"expected={self.last_order_code!r} used_materials={len(materials)}"
-        )
+            event_status = "completed"
+            if str(data.get("status")) in ["-11", "-12"]:
+                event_status = "error"
+            elif str(data.get("status")) == "30":
+                event_status = "completed"
+            else:
+                event_status = "running"
 
-        if self.last_order_code and order_code == self.last_order_code:
-            logger.info("[peptide] order_finish orderCode 匹配，触发 order_finish_event")
-            self.order_finish_event.set()
-        else:
+            publish_task_status = getattr(self, "_publish_task_status", None)
+            if callable(publish_task_status):
+                publish_task_status(
+                    task_id=data.get("orderCode"),
+                    task_code=data.get("orderCode"),
+                    task_type="bioyond_order",
+                    status=event_status,
+                    progress=1.0 if event_status in ["completed", "error"] else 0.9,
+                    result={
+                        "order_name": data.get("orderName"),
+                        "status": status_desc,
+                        "materials_count": len(materials),
+                    },
+                )
+
+            order_code = str(data.get("orderCode") or "")
+            expected_order_code = getattr(self, "last_order_code", None)
+            self.last_order_report = data
+            self.last_used_materials = materials
+
             logger.info(
-                f"[peptide] order_finish orderCode 不匹配当前等待项，仅记录 "
-                f"(expected={self.last_order_code!r} got={order_code!r})"
+                f"[peptide] /report/order_finish 收到: orderCode={order_code} status={data.get('status')} "
+                f"expected={expected_order_code!r} used_materials={len(materials)}"
             )
-        return base_result
+
+            should_set_order_event = bool(expected_order_code and order_code == expected_order_code)
+            if should_set_order_event:
+                logger.info("[peptide] order_finish orderCode 匹配，准备同步订单物料后触发 order_finish_event")
+            else:
+                logger.info(
+                    f"[peptide] order_finish orderCode 不匹配当前等待项，仅记录 "
+                    f"(expected={expected_order_code!r} got={order_code!r})"
+                )
+
+            material_sync: Dict[str, Any] = {"requested": False, "status": "skipped"}
+            reported_order_id = str(
+                data.get("orderId")
+                or data.get("order_id")
+                or ""
+            ).strip()
+            if not reported_order_id and expected_order_code and order_code == expected_order_code:
+                reported_order_id = str(getattr(self, "last_order_id", None) or "").strip()
+            if reported_order_id:
+                try:
+                    material_sync = self._sync_order_materials_from_bioyond(
+                        reported_order_id,
+                        reason="order_finish_report",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[peptide] order_finish 订单物料同步失败: "
+                        f"order_id={reported_order_id} error={exc}"
+                    )
+                    material_sync = {
+                        "requested": True,
+                        "status": "failed",
+                        "order_id": reported_order_id,
+                        "error": str(exc),
+                    }
+            try:
+                self.last_order_material_sync = material_sync
+            except Exception:
+                pass
+            if should_set_order_event:
+                order_finish_event = getattr(self, "order_finish_event", None)
+                if order_finish_event is not None:
+                    order_finish_event.set()
+
+            return {
+                "processed": True,
+                "order_code": data.get("orderCode"),
+                "status": data.get("status"),
+                "materials_count": len(materials),
+                "material_sync": material_sync,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        except Exception as exc:
+            logger.error(f"处理任务完成报送失败: {exc}")
+            return {"processed": False, "error": str(exc)}
+
+    def process_step_finish_report(self, report_request: Any) -> Dict[str, Any]:
+        """处理步骤完成报送，发布状态但不触发全量物料同步。"""
+        try:
+            data = getattr(report_request, "data", None) or {}
+            logger.info(f"[步骤完成报送] 订单: {data.get('orderCode')}, 步骤: {data.get('stepName')}")
+            logger.info(f"  样品ID: {data.get('sampleId')}")
+            logger.info(f"  开始时间: {data.get('startTime')}")
+            logger.info(f"  结束时间: {data.get('endTime')}")
+
+            publish_task_status = getattr(self, "_publish_task_status", None)
+            if callable(publish_task_status):
+                publish_task_status(
+                    task_id=data.get("orderCode"),
+                    task_code=data.get("orderCode"),
+                    task_type="bioyond_step",
+                    status="running",
+                    progress=0.5,
+                    result={"step_name": data.get("stepName"), "step_id": data.get("stepId")},
+                )
+
+            return {
+                "processed": True,
+                "step_id": data.get("stepId"),
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        except Exception as exc:
+            logger.error(f"处理步骤完成报送失败: {exc}")
+            return {"processed": False, "error": str(exc)}
 
     @action(
         always_free=True,
@@ -1679,7 +1388,9 @@ class BioyondPeptideStation(BioyondWorkstation):
 
             # 3) 准备事件状态，必须在 last_order_code 赋值后再 clear()，避免基类回调竞态。
             self.last_order_code = normalized_order_code
+            self.last_order_id = normalized_order_id
             self.last_order_report = None
+            self.last_order_material_sync = None
             self.last_used_materials = []
             self.order_finish_event.clear()
 
@@ -1722,11 +1433,25 @@ class BioyondPeptideStation(BioyondWorkstation):
             # 6) 仅在 status 命中已知正常状态时拉取实验台物料；timeout / unknown / missing 不调。
             materials_by_order_id: List[Dict[str, Any]] = []
             unload_table = self._build_unload_table([])
+            material_sync: Dict[str, Any] = {"requested": False, "status": "skipped"}
             if mapped_status in {"success", "abnormal_stop", "manual_stop"} and normalized_order_id:
                 try:
-                    unload_payload = self._construct_unload_table_payload(normalized_order_id)
-                    materials_by_order_id = unload_payload["materials_by_order_id"]
-                    unload_table = unload_payload["resultTable"]
+                    cached_sync = getattr(self, "last_order_material_sync", None)
+                    if (
+                        isinstance(cached_sync, dict)
+                        and cached_sync.get("requested")
+                        and cached_sync.get("order_id") == normalized_order_id
+                        and cached_sync.get("status") == "synced"
+                    ):
+                        material_sync = cached_sync
+                        materials_by_order_id = list(cached_sync.get("materials") or [])
+                        unload_rows = self._build_unload_rows_from_materials_by_order_id(materials_by_order_id)
+                        unload_table = self._build_unload_table(unload_rows)
+                    else:
+                        unload_payload = self._construct_unload_table_payload(normalized_order_id)
+                        materials_by_order_id = unload_payload["materials_by_order_id"]
+                        unload_table = unload_payload["resultTable"]
+                        material_sync = unload_payload.get("material_sync", material_sync)
                 except Exception as exc:
                     logger.error(
                         f"[peptide] wait_for_order_finish 调用 materials_by_order_id 失败: {exc}",
@@ -1746,6 +1471,7 @@ class BioyondPeptideStation(BioyondWorkstation):
                 "order_finish_report": report if isinstance(report, dict) else {},
                 "used_materials": used_materials_serialized,
                 "materials_by_order_id": materials_by_order_id,
+                "material_sync": material_sync,
                 "resultTable": unload_table,
                 "confirmation_message": (
                     f"任务完成: status={mapped_status}; 已整理 {len(unload_table.get('data', []))} 行下料指引"
@@ -1891,6 +1617,7 @@ class BioyondPeptideStation(BioyondWorkstation):
                 raise RuntimeError("下料未确认，拒绝调用 take-out")
 
             rpc = self._require_hardware_interface("take_out")
+            order_material_ids = self._collect_order_material_ids(normalized_order_id)
             logger.info(
                 f"[peptide] unload_materials 调用 take_out: order_id={normalized_order_id}"
             )
@@ -1908,10 +1635,41 @@ class BioyondPeptideStation(BioyondWorkstation):
                 message = ""
                 normalized_response = {}
 
+            deleted_materials = {"material_ids": order_material_ids, "removed_from_deck": 0, "removed_from_cache": 0}
+            post_take_out_sync: Dict[str, Any] = {"requested": False, "status": "skipped"}
+            if success:
+                try:
+                    post_take_out_sync = self._sync_order_materials_from_bioyond(
+                        normalized_order_id,
+                        reason="unload_materials",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[peptide] unload_materials take_out 后订单物料同步失败: "
+                        f"order_id={normalized_order_id} error={exc}"
+                    )
+                    post_take_out_sync = {
+                        "requested": True,
+                        "status": "failed",
+                        "order_id": normalized_order_id,
+                        "error": str(exc),
+                    }
+                if (
+                    post_take_out_sync.get("status") == "failed"
+                    or (not post_take_out_sync.get("material_count") and order_material_ids)
+                ):
+                    deleted_materials = self._delete_bioyond_materials_from_cache_and_deck(
+                        order_material_ids,
+                        publish_tree=True,
+                        reason=f"unload_materials:{normalized_order_id}",
+                    )
+
             return {
                 "success": bool(success),
                 "order_id": normalized_order_id,
                 "take_out_result": normalized_response,
+                "deleted_materials": deleted_materials,
+                "post_take_out_sync": post_take_out_sync,
                 "confirmation_message": (
                     "下料确认，已通知奔耀 take-out 成功"
                     if success
@@ -1926,6 +1684,9 @@ class BioyondPeptideStation(BioyondWorkstation):
             "reset_order_status": True,
             "reset_location": True,
             "reset_devices": False,
+            "sync_materials_after_reset": True,
+            "clear_stale_after_reset": True,
+            "publish_tree_after_reset": True,
         },
         description="自动复位调度器/订单状态/库位，可选仪器复位",
     )
@@ -1935,6 +1696,9 @@ class BioyondPeptideStation(BioyondWorkstation):
         reset_order_status: bool = True,
         reset_location: bool = True,
         reset_devices: bool = False,
+        sync_materials_after_reset: bool = True,
+        clear_stale_after_reset: bool = True,
+        publish_tree_after_reset: bool = True,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """自动复位调度器/订单状态/库位，可选仪器复位。
@@ -1944,15 +1708,25 @@ class BioyondPeptideStation(BioyondWorkstation):
             reset_order_status[订单状态复位]: 调用 /api/lims/order/reset-order-status，默认勾选。
             reset_location[库位复位]: 调用 /api/lims/storage/reset-location，默认勾选。
             reset_devices[仪器复位]: 调用 /api/lims/device/reset-devices，默认不勾选。
+            sync_materials_after_reset[复位后同步物料]: 库位复位成功后拉取库存并更新本地资源树，默认勾选。
+            clear_stale_after_reset[同步时清理陈旧缓存]: 复位后同步时清理本次库存快照外的旧缓存，默认勾选。
+            publish_tree_after_reset[同步后发布资源树]: 复位后同步成功时发布资源树，默认勾选。
         """
         del kwargs
         with self._debug_call_session("reset_auto"):
-            return self._execute_reset_operations(
+            payload = self._execute_reset_operations(
                 reset_scheduler=bool(reset_scheduler),
                 reset_order_status=bool(reset_order_status),
                 reset_location=bool(reset_location),
                 reset_devices=bool(reset_devices),
             )
+            self._attach_reset_material_sync(
+                payload,
+                sync_materials_after_reset=bool(sync_materials_after_reset),
+                clear_stale_after_reset=bool(clear_stale_after_reset),
+                publish_tree_after_reset=bool(publish_tree_after_reset),
+            )
+            return payload
 
     @action(
         always_free=True,
@@ -1963,6 +1737,9 @@ class BioyondPeptideStation(BioyondWorkstation):
             "reset_order_status": True,
             "reset_location": True,
             "reset_devices": False,
+            "sync_materials_after_reset": True,
+            "clear_stale_after_reset": True,
+            "publish_tree_after_reset": True,
             "physical_cleanup_confirmed": False,
             "timeout_seconds": 3600,
             "assignee_user_ids": [],
@@ -1976,6 +1753,9 @@ class BioyondPeptideStation(BioyondWorkstation):
         reset_order_status: bool = True,
         reset_location: bool = True,
         reset_devices: bool = False,
+        sync_materials_after_reset: bool = True,
+        clear_stale_after_reset: bool = True,
+        publish_tree_after_reset: bool = True,
         physical_cleanup_confirmed: bool = False,
         timeout_seconds: int = 3600,
         assignee_user_ids: Optional[List[str]] = None,
@@ -1992,6 +1772,9 @@ class BioyondPeptideStation(BioyondWorkstation):
             reset_order_status[订单状态复位]: 调用 /api/lims/order/reset-order-status，默认勾选。
             reset_location[库位复位]: 调用 /api/lims/storage/reset-location，默认勾选。
             reset_devices[仪器复位]: 调用 /api/lims/device/reset-devices，默认不勾选。
+            sync_materials_after_reset[复位后同步物料]: 库位复位成功后拉取库存并更新本地资源树，默认勾选。
+            clear_stale_after_reset[同步时清理陈旧缓存]: 复位后同步时清理本次库存快照外的旧缓存，默认勾选。
+            publish_tree_after_reset[同步后发布资源树]: 复位后同步成功时发布资源树，默认勾选。
             physical_cleanup_confirmed[物理清理确认]: 确认弹窗中的物料检查已完成，默认不勾选；未勾选时不会调用任何 RPC。
         """
         del kwargs, timeout_seconds, assignee_user_ids
@@ -2020,6 +1803,12 @@ class BioyondPeptideStation(BioyondWorkstation):
                 reset_order_status=bool(reset_order_status),
                 reset_location=bool(reset_location),
                 reset_devices=bool(reset_devices),
+            )
+            self._attach_reset_material_sync(
+                payload,
+                sync_materials_after_reset=bool(sync_materials_after_reset),
+                clear_stale_after_reset=bool(clear_stale_after_reset),
+                publish_tree_after_reset=bool(publish_tree_after_reset),
             )
             payload["physical_cleanup_confirmed"] = True
             payload["confirmation_message"] = RESET_MANUAL_CONFIRM_MESSAGE
@@ -2189,15 +1978,49 @@ class BioyondPeptideStation(BioyondWorkstation):
         normalized_preintake_ids = self._normalize_string_list(preintake_ids)
         normalized_material_ids = self._normalize_string_list(material_ids)
         rpc = self._require_hardware_interface("take_out")
+        order_material_ids = self._collect_order_material_ids(
+            normalized_order_id,
+            explicit_material_ids=normalized_material_ids,
+        )
         with self._debug_call_session("take_out"):
             raw = rpc.take_out(normalized_order_id, normalized_preintake_ids, normalized_material_ids)
         code = raw.get("code") if isinstance(raw, dict) else None
         message = str(raw.get("message", "") or "") if isinstance(raw, dict) else ""
+        post_take_out_sync: Dict[str, Any] = {"requested": False, "status": "skipped"}
+        deleted_materials = {"material_ids": order_material_ids, "removed_from_deck": 0, "removed_from_cache": 0}
+        if code == 1:
+            try:
+                post_take_out_sync = self._sync_order_materials_from_bioyond(
+                    normalized_order_id,
+                    reason="take_out",
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[peptide] take_out 后订单物料同步失败: order_id={normalized_order_id} error={exc}"
+                )
+                post_take_out_sync = {
+                    "requested": True,
+                    "status": "failed",
+                    "order_id": normalized_order_id,
+                    "error": str(exc),
+                }
+            if (
+                post_take_out_sync.get("status") == "failed"
+                or (not post_take_out_sync.get("material_count") and order_material_ids)
+            ):
+                deleted_materials = self._delete_bioyond_materials_from_cache_and_deck(
+                    order_material_ids,
+                    publish_tree=True,
+                    reason=f"take_out:{normalized_order_id}",
+                )
         return {
             "success": code == 1,
             "order_id": normalized_order_id,
             "preintake_ids": normalized_preintake_ids,
             "material_ids": normalized_material_ids,
+            "order_material_ids": order_material_ids,
+            "deleted_materials": deleted_materials,
+            "post_take_out_sync": post_take_out_sync,
             "take_out": raw if isinstance(raw, dict) else {},
             "raw_result": raw if isinstance(raw, dict) else {},
             "code": code,
@@ -2224,16 +2047,19 @@ class BioyondPeptideStation(BioyondWorkstation):
         normalized_order_id = str(order_id or "").strip()
         if not normalized_order_id:
             raise ValueError("materials_by_order_id 需要 order_id")
-        rpc = self._require_hardware_interface("materials_by_order_id")
-        payload = {"orderId": normalized_order_id}
         with self._debug_call_session("materials_by_order_id"):
-            raw = rpc.materials_by_order_id(json.dumps(payload, ensure_ascii=False))
-        materials = list(raw) if isinstance(raw, list) else []
+            material_sync = self._sync_order_materials_from_bioyond(
+                normalized_order_id,
+                reason="materials_by_order_id",
+            )
+        materials = list(material_sync.get("materials") or [])
         return {
             "success": bool(materials),
             "order_id": normalized_order_id,
             "materials": materials,
             "material_count": len(materials),
+            "cache": {"available": True, "status": material_sync.get("status")},
+            "material_sync": material_sync,
         }
 
     @action(
@@ -2294,7 +2120,6 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="实验ID", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
             ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="实验ID", data_key="order_id", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="file_zip", data_type="str", label="报告 ZIP 文件", data_key="file_zip", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(key="file_pdf", data_type="str", label="报告 PDF 文件", data_key="file_pdf", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="files", data_type="array", label="报告文件列表", data_key="files", data_source=DataSource.EXECUTOR),
         ],
     )
@@ -2306,14 +2131,12 @@ class BioyondPeptideStation(BioyondWorkstation):
         api_host = str(getattr(rpc, "host", "") or self.bioyond_config.get("api_host", "")).rstrip("/")
         file_urls = [self._join_api_url(api_host, path) for path in files]
         zip_urls = [url for url in file_urls if url.lower().endswith(".zip")]
-        pdf_urls = [url for url in file_urls if url.lower().endswith(".pdf")]
         file_zip = zip_urls[-1] if zip_urls else ""
-        file_pdf = pdf_urls[-1] if pdf_urls else ""
-        return {"success": True, "order_id": resolved, "file_zip": file_zip, "file_pdf": file_pdf, "files": file_urls, "file_count": len(file_urls)}
+        return {"success": True, "order_id": resolved, "file_zip": file_zip, "files": file_urls, "file_count": len(file_urls)}
 
     @action(
         always_free=True,
-        goal_default={"title": "", "values": ""},
+        goal_default={"title": "", "values": None},
         description="展示上游传入的任意内容",
         handles=[
             ActionInputHandle(key="values", data_type="str", label="内容", data_key="values", data_source=DataSource.HANDLE, io_type="source"),
@@ -2321,7 +2144,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionOutputHandle(key="values", data_type="str", label="内容", data_key="values", data_source=DataSource.EXECUTOR),
         ],
     )
-    def display_values(self, title: str = "", values: str = "", **kwargs: Any) -> Dict[str, Any]:
+    def display_values(self, title: str = "", values: Any = None, **kwargs: Any) -> Dict[str, Any]:
         """普通展示节点：透传任意上游内容。"""
         del kwargs
         return {"success": True, "title": str(title or ""), "values": self._display_text(values)}
@@ -2332,7 +2155,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         placeholder_keys={"assignee_user_ids": "unilabos_manual_confirm"},
         goal_default={
             "title": "",
-            "values": "",
+            "values": None,
             "display_confirmed": False,
             "timeout_seconds": 3600,
             "assignee_user_ids": [],
@@ -2349,7 +2172,7 @@ class BioyondPeptideStation(BioyondWorkstation):
     def display_values_manual_confirm(
         self,
         title: str = "",
-        values: str = "",
+        values: Any = None,
         display_confirmed: bool = False,
         timeout_seconds: int = 3600,
         assignee_user_ids: Optional[List[str]] = None,
@@ -2948,6 +2771,101 @@ class BioyondPeptideStation(BioyondWorkstation):
         source = value if isinstance(value, list) else [value]
         return [str(item).strip() for item in source if str(item or "").strip()]
 
+    @staticmethod
+    def _material_id_from_any(item: Any) -> str:
+        if isinstance(item, dict):
+            value = item.get("id") or item.get("materialId") or item.get("material_id")
+        else:
+            value = getattr(item, "materialId", None) or getattr(item, "id", None)
+        return str(value or "").strip()
+
+    def _cache_order_materials(
+        self,
+        materials: List[Dict[str, Any]],
+        *,
+        source: str,
+        order_id: str = "",
+    ) -> Dict[str, Any]:
+        """订单粒度更新物料缓存；不清理全局库存。"""
+        synchronizer = getattr(self, "resource_synchronizer", None)
+        if synchronizer is None or not hasattr(synchronizer, "_update_material_cache_from_stock"):
+            return {"updated_count": 0, "records_count": 0, "available": False}
+
+        normalized: List[Dict[str, Any]] = []
+        for material in materials or []:
+            if not isinstance(material, dict):
+                continue
+            payload = dict(material)
+            if "id" not in payload and payload.get("materialId"):
+                payload["id"] = payload.get("materialId")
+            if "name" not in payload and payload.get("materialName"):
+                payload["name"] = payload.get("materialName")
+            if "code" not in payload and payload.get("materialCode"):
+                payload["code"] = payload.get("materialCode")
+            if "typeName" not in payload and payload.get("materialTypeName"):
+                payload["typeName"] = payload.get("materialTypeName")
+            payload.setdefault("locations", payload.get("locations") or [])
+            if order_id:
+                payload["_order_id"] = order_id
+            normalized.append(payload)
+
+        if hasattr(synchronizer, "_resolve_material_payloads"):
+            normalized = synchronizer._resolve_material_payloads(normalized, source=source)
+        result = synchronizer._update_material_cache_from_stock(normalized, source=source)
+        result["available"] = True
+        return result
+
+    def _cache_order_allocation_rows(
+        self,
+        allocation_rows: List[Dict[str, Any]],
+        *,
+        order_ids: List[str],
+        source: str,
+    ) -> Dict[str, Any]:
+        materials: List[Dict[str, Any]] = []
+        for row in allocation_rows or []:
+            if not isinstance(row, dict):
+                continue
+            material_id = str(row.get("materialId") or "").strip()
+            if not material_id:
+                continue
+            material = {
+                "id": material_id,
+                "name": row.get("materialName"),
+                "code": row.get("materialCode"),
+                "typeName": row.get("materialTypeName"),
+                "materialTypeMode": row.get("materialTypeMode"),
+                "quantity": row.get("quantity"),
+                "unit": row.get("unit"),
+                "combinedMaterialId": row.get("combinedMaterialId"),
+                "parameters": row.get("materialParams") or row.get("parameters"),
+                "locations": row.get("locations") if isinstance(row.get("locations"), list) else [],
+                "_order_ids": list(order_ids or []),
+                "raw_allocation_row": dict(row),
+            }
+            materials.append(material)
+        result = self._cache_order_materials(materials, source=source)
+        result["allocation_count"] = len(materials)
+        return result
+
+    def _collect_order_material_ids(
+        self,
+        order_id: str,
+        *,
+        explicit_material_ids: Optional[List[str]] = None,
+    ) -> List[str]:
+        material_ids = set(self._normalize_string_list(explicit_material_ids))
+        try:
+            order_materials = self._fetch_materials_by_order_id(order_id)
+        except Exception as exc:
+            logger.warning(f"[peptide] take_out 前查询订单物料失败: order_id={order_id} error={exc}")
+            order_materials = []
+        for item in order_materials:
+            material_id = self._material_id_from_any(item)
+            if material_id:
+                material_ids.add(material_id)
+        return sorted(material_ids)
+
     @classmethod
     def _build_unload_rows_from_materials_by_order_id(
         cls,
@@ -3004,11 +2922,101 @@ class BioyondPeptideStation(BioyondWorkstation):
         rpc_for_stock = self._require_hardware_interface("materials_by_order_id")
         payload = {"orderId": normalized_order_id}
         raw = rpc_for_stock.materials_by_order_id(json.dumps(payload, ensure_ascii=False))
-        return list(raw) if isinstance(raw, list) else []
+        materials = list(raw) if isinstance(raw, list) else []
+        self._cache_order_materials(
+            materials,
+            source="materials_by_order_id",
+            order_id=normalized_order_id,
+        )
+        return materials
+
+    def _normalize_order_material_payload(
+        self,
+        material: Dict[str, Any],
+        *,
+        order_id: str = "",
+    ) -> Dict[str, Any]:
+        payload = dict(material)
+        if "id" not in payload and payload.get("materialId"):
+            payload["id"] = payload.get("materialId")
+        if "name" not in payload and payload.get("materialName"):
+            payload["name"] = payload.get("materialName")
+        if "code" not in payload and payload.get("materialCode"):
+            payload["code"] = payload.get("materialCode")
+        if "typeName" not in payload and payload.get("materialTypeName"):
+            payload["typeName"] = payload.get("materialTypeName")
+        payload.setdefault("locations", payload.get("locations") if isinstance(payload.get("locations"), list) else [])
+        if order_id:
+            payload["_order_id"] = order_id
+        return payload
+
+    def _order_material_mutation_rank(self, material: Dict[str, Any]) -> int:
+        payload = self._normalize_order_material_payload(material)
+        locations = payload.get("locations") or []
+        combined_parent_id = str(payload.get("combinedMaterialId") or "").strip()
+        if not locations and not combined_parent_id:
+            return 0
+        if self._find_material_resource(payload) is not None:
+            return 1
+        return 2
+
+    def _sync_order_materials_from_bioyond(
+        self,
+        order_id: str,
+        *,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """按订单拉取物料，按 delete/change/add 顺序更新本地资源树。"""
+        normalized_order_id = str(order_id or "").strip()
+        if not normalized_order_id:
+            return {
+                "requested": False,
+                "status": "skipped",
+                "reason": "missing_order_id",
+                "materials": [],
+                "material_count": 0,
+                "mutations": [],
+            }
+
+        materials = self._fetch_materials_by_order_id(normalized_order_id)
+        normalized_materials = [
+            self._normalize_order_material_payload(material, order_id=normalized_order_id)
+            for material in materials
+            if isinstance(material, dict)
+        ]
+        mutation_results: List[Dict[str, Any]] = []
+        for material in sorted(normalized_materials, key=self._order_material_mutation_rank):
+            try:
+                mutation_results.append(self.process_material_change_report(material))
+            except Exception as exc:
+                logger.warning(
+                    f"[peptide] 订单物料资源树更新失败: order_id={normalized_order_id} "
+                    f"reason={reason} material={self._material_id_from_any(material)} error={exc}"
+                )
+                mutation_results.append({
+                    "processed": False,
+                    "material_id": self._material_id_from_any(material),
+                    "error": str(exc),
+                })
+
+        return {
+            "requested": True,
+            "status": "synced" if all(item.get("processed") for item in mutation_results) else "partial",
+            "reason": reason,
+            "order_id": normalized_order_id,
+            "materials": materials,
+            "material_count": len(materials),
+            "mutations": mutation_results,
+            "published_count": sum(1 for item in mutation_results if item.get("published")),
+        }
 
     def _construct_unload_table_payload(self, order_id: str) -> Dict[str, Any]:
         normalized_order_id = str(order_id or "").strip()
-        materials_by_order_id = self._fetch_materials_by_order_id(normalized_order_id)
+        material_sync = self._sync_order_materials_from_bioyond(
+            normalized_order_id,
+            reason="order_finish",
+        )
+        materials_by_order_id = list(material_sync.get("materials") or [])
         unload_rows = self._build_unload_rows_from_materials_by_order_id(materials_by_order_id)
         unload_table = self._build_unload_table(unload_rows)
         return {
@@ -3016,6 +3024,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             "order_id": normalized_order_id,
             "materials_by_order_id": materials_by_order_id,
             "resultTable": unload_table,
+            "material_sync": material_sync,
             "confirmation_message": f"已整理 {len(unload_rows)} 行下料指引",
         }
 
@@ -3083,6 +3092,43 @@ class BioyondPeptideStation(BioyondWorkstation):
             {"key": key, "label": RESET_OPERATION_LABELS[key], "selected": flags[key]}
             for key in RESET_OPERATION_KEYS
         ]
+
+    @staticmethod
+    def _reset_operation_succeeded(payload: Dict[str, Any], operation: str) -> bool:
+        for call in payload.get("executed_calls", []) or []:
+            if call.get("operation") != operation:
+                continue
+            result = call.get("result") if isinstance(call.get("result"), dict) else {}
+            return result.get("code") == 1 and not call.get("error")
+        return False
+
+    def _attach_reset_material_sync(
+        self,
+        payload: Dict[str, Any],
+        *,
+        sync_materials_after_reset: bool,
+        clear_stale_after_reset: bool,
+        publish_tree_after_reset: bool,
+    ) -> None:
+        if not sync_materials_after_reset:
+            payload["material_sync"] = {"requested": False, "status": "disabled"}
+            return
+        selected = {
+            item.get("key"): bool(item.get("selected"))
+            for item in payload.get("selected_operations", []) or []
+            if isinstance(item, dict)
+        }
+        if not selected.get("reset_location"):
+            payload["material_sync"] = {"requested": False, "status": "reset_location_not_selected"}
+            return
+        if not self._reset_operation_succeeded(payload, "reset_location"):
+            payload["material_sync"] = {"requested": False, "status": "reset_location_failed"}
+            return
+
+        payload["material_sync"] = self.sync_materials_from_bioyond(
+            publish_tree=publish_tree_after_reset,
+            clear_stale=clear_stale_after_reset,
+        )
 
     def _execute_reset_operations(
         self,

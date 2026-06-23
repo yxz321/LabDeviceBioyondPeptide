@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 import sys
 from pathlib import Path
@@ -80,6 +81,28 @@ def _import_module() -> Any:
     return importlib.import_module(MODULE_PATH)
 
 
+class _FakeMaterialSynchronizer:
+    def __init__(self) -> None:
+        self.cache: Dict[str, Dict[str, Any]] = {}
+
+    def _resolve_material_payloads(self, materials: List[Dict[str, Any]], source: str) -> List[Dict[str, Any]]:
+        return [dict(item, _source=source) for item in materials]
+
+    def _update_material_cache_from_stock(
+        self,
+        materials: List[Dict[str, Any]],
+        source: str = "stock-material",
+    ) -> Dict[str, int]:
+        updated = 0
+        for material in materials:
+            material_id = str(material.get("id") or material.get("materialId") or "").strip()
+            if not material_id:
+                continue
+            self.cache[material_id] = dict(material, source=source)
+            updated += 1
+        return {"records_count": len(self.cache), "updated_count": updated}
+
+
 def _make_station() -> Any:
     module = _import_module()
     cls = getattr(module, CLASS_NAME)
@@ -90,6 +113,7 @@ def _make_station() -> Any:
     rpc.api_key = "k"
     rpc.material_info.return_value = {"locations": [{"whName": "自动化堆栈", "code": "1-01"}]}
     station.hardware_interface = rpc
+    station.resource_synchronizer = _FakeMaterialSynchronizer()
     return station
 
 
@@ -198,8 +222,7 @@ def test_required_actions_exposed() -> None:
         "scheduler_pause",
         "scheduler_continue",
         "update_push_ip",
-        "wait_for_error_handling",
-        "reply_error_handling",
+        "sync_materials_from_bioyond",
         "get_order_list",
         "take_out",
         "materials_by_order_id",
@@ -219,13 +242,7 @@ def test_required_actions_exposed() -> None:
 def test_manual_confirm_node_types() -> None:
     module = _import_module()
     cls = getattr(module, CLASS_NAME)
-    manual = {
-        "confirm_cem_info",
-        "start_experiment",
-        "reset_manual",
-        "reply_error_handling",
-        "display_values_manual_confirm",
-    }
+    manual = {"confirm_cem_info", "start_experiment", "reset_manual", "display_values_manual_confirm"}
     normal = {
         "submit_experiment",
         "submit_experiment_day1",
@@ -238,7 +255,7 @@ def test_manual_confirm_node_types() -> None:
         "scheduler_start",
         "list_sample_excels",
         "get_step_parameters",
-        "wait_for_error_handling",
+        "sync_materials_from_bioyond",
         "get_order_list",
         "get_order_report",
         "get_order_report_files",
@@ -272,6 +289,51 @@ def test_day1_submit_is_normal_action_signature() -> None:
     sig = inspect.signature(cls.submit_experiment_day1)
     has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
     assert not has_kwargs, "submit_experiment_day1 已是普通 action，不应接收人工确认框架字段"
+
+
+def test_sync_materials_from_bioyond_syncs_and_publishes() -> None:
+    cls = getattr(_import_module(), CLASS_NAME)
+    station = object.__new__(cls)
+    synchronizer = MagicMock()
+    synchronizer.sync_from_external.return_value = True
+    synchronizer.last_sync_result = {"fetched_count": 2, "converted_count": 2}
+    station.resource_synchronizer = synchronizer
+    station._publish_material_tree_update = MagicMock(return_value=True)
+    debug_sessions = []
+
+    @contextmanager
+    def debug_session(action_name: str):
+        debug_sessions.append(action_name)
+        yield None
+
+    station._debug_call_session = debug_session
+
+    result = station.sync_materials_from_bioyond()
+
+    assert result["success"] is True
+    assert result["published"] is True
+    assert result["publish_requested"] is True
+    assert result["sync_result"] == {"fetched_count": 2, "converted_count": 2}
+    assert result["clear_stale"] is False
+    assert debug_sessions == ["sync_materials_from_bioyond"]
+    synchronizer.sync_from_external.assert_called_once_with(clear_stale=False)
+    station._publish_material_tree_update.assert_called_once_with("manual_full_sync")
+
+
+def test_sync_materials_from_bioyond_can_skip_publish() -> None:
+    cls = getattr(_import_module(), CLASS_NAME)
+    station = object.__new__(cls)
+    synchronizer = MagicMock()
+    synchronizer.sync_from_external.return_value = True
+    station.resource_synchronizer = synchronizer
+    station._publish_material_tree_update = MagicMock(return_value=True)
+
+    result = station.sync_materials_from_bioyond(publish_tree=False)
+
+    assert result["success"] is True
+    assert result["published"] is False
+    assert result["publish_requested"] is False
+    station._publish_material_tree_update.assert_not_called()
 
 
 def test_typed_dicts_present() -> None:
@@ -534,6 +596,15 @@ def test_submit_experiment_rejects_day1_alias() -> None:
 def test_submit_experiment_day2_calls_pipeline() -> None:
     station = _make_station()
     _wire_submit_pipeline(station)
+    station.hardware_interface.materials_by_order_id.return_value = [
+        {
+            "materialId": "order-mat-1",
+            "materialName": "订单物料",
+            "materialCode": "0007-00001",
+            "quantity": 1,
+            "locations": [],
+        }
+    ]
     result = station.submit_experiment_day2(
         {"sample_excel_pattern": ""},
         {"parameter_overrides": []},
@@ -542,8 +613,30 @@ def test_submit_experiment_day2_calls_pipeline() -> None:
     assert result["success"] is True
     assert result["order_ids"] == [ORDER_GUID]
     assert result["auto_register_materials"] is True
-    assert result["material_registration"]["status"] == "not_implemented"
+    assert result["material_registration"]["status"] == "cached"
+    assert result["material_registration"]["cache"]["updated_count"] == 3
+    assert result["material_registration"]["order_id_sync"]["status"] == "synced"
+    assert result["material_registration"]["order_id_sync"]["material_count"] == 1
+    assert result["material_registration"]["order_id_sync"]["deck_sync"]["published_count"] == 0
+    assert result["materials_by_order_id"][0]["materialId"] == "order-mat-1"
+    order_payload = json.loads(station.hardware_interface.materials_by_order_id.call_args.args[0])
+    assert order_payload == {"orderId": ORDER_GUID}
     assert result["sample_excel_relative_path"] == "upload\\sample\\f.xlsx"
+
+
+def test_submit_experiment_day2_can_skip_order_id_sync() -> None:
+    station = _make_station()
+    _wire_submit_pipeline(station)
+    result = station.submit_experiment_day2(
+        {"sample_excel_pattern": ""},
+        {"parameter_overrides": [], "auto_register_materials": False},
+        sample_excel_relative_path="upload/sample/f.xlsx",
+    )
+
+    assert result["auto_register_materials"] is False
+    assert result["material_registration"]["order_id_sync"]["requested"] is False
+    assert result["materials_by_order_id"] == []
+    station.hardware_interface.materials_by_order_id.assert_not_called()
 
 
 def test_submit_experiment_day1_calls_pipeline_and_injects_default_cem_method() -> None:
@@ -603,12 +696,7 @@ def test_prepare_cem_preserves_raw_pdf_path_but_normalizes_url() -> None:
 def test_prepare_cem_handle_keys() -> None:
     cls = getattr(_import_module(), CLASS_NAME)
     meta = getattr(cls.prepare_cem, "_action_registry_meta", {})
-    handles = meta.get("handles", [])
-    if isinstance(handles, dict):
-        handle_items = list(handles.get("input", [])) + list(handles.get("output", []))
-        handle_keys = [handle.get("handler_key") or handle.get("key") for handle in handle_items]
-    else:
-        handle_keys = [handle.key for handle in handles]
+    handle_keys = _action_handle_keys(meta)
     assert "cem_method_file_name" in handle_keys
     assert "sample_excel_relative_path" in handle_keys
     assert "cem_pdf_path" in handle_keys
@@ -888,9 +976,8 @@ def test_direct_take_out_and_batch_cancel_metadata() -> None:
     cancel_meta = getattr(cls.batch_cancel_experiment, "_action_registry_meta", {})
     assert take_out_meta.get("goal_default") == {"order_id": "", "preintake_ids": [], "material_ids": []}
     assert materials_meta.get("goal_default") == {"order_id": ""}
-    materials_keys = _action_handle_keys(materials_meta)
-    assert "order_id" in materials_keys
-    assert "materials" in materials_keys
+    assert "order_id" in _action_handle_keys(materials_meta)
+    assert "materials" in _action_handle_keys(materials_meta)
     assert construct_meta.get("goal_default") == {"order_id": ""}
     construct_keys = _action_handle_keys(construct_meta)
     assert {"order_id", "materials_by_order_id", "resultTable"} <= set(construct_keys)
@@ -954,10 +1041,7 @@ def test_display_values_manual_confirm_metadata_and_return() -> None:
     }
     handle_keys = _action_handle_keys(meta)
     assert {"values", "assignee_user_ids", "title"} <= set(handle_keys)
-    values_handles = [
-        handle for handle in _action_handle_items(meta)
-        if _action_handle_key(handle) == "values"
-    ]
+    values_handles = [handle for handle in _action_handle_items(meta) if _action_handle_key(handle) == "values"]
     assert values_handles
     assert all(_action_handle_attr(handle, "data_type") == "str" for handle in values_handles)
 
@@ -1337,6 +1421,38 @@ def test_rpc_reset_location_sends_no_data_key() -> None:
     assert set(sent_params.keys()) == {"apiKey", "requestTime"}
 
 
+def test_rpc_constructor_can_skip_startup_material_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    from bioyond_peptide_station._vendored.bioyond_rpc import BioyondV1RPC
+
+    load_cache = MagicMock()
+    monkeypatch.setattr(BioyondV1RPC, "_load_material_cache", load_cache)
+
+    rpc = BioyondV1RPC({
+        "api_key": "k",
+        "api_host": "http://offline.invalid",
+        "warehouse_mapping": {},
+        "load_material_cache_on_init": False,
+    })
+
+    assert rpc.material_cache == {}
+    load_cache.assert_not_called()
+
+
+def test_rpc_constructor_loads_material_cache_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    from bioyond_peptide_station._vendored.bioyond_rpc import BioyondV1RPC
+
+    load_cache = MagicMock()
+    monkeypatch.setattr(BioyondV1RPC, "_load_material_cache", load_cache)
+
+    BioyondV1RPC({
+        "api_key": "k",
+        "api_host": "http://offline.invalid",
+        "warehouse_mapping": {},
+    })
+
+    load_cache.assert_called_once_with()
+
+
 def test_update_push_ip_defaults_to_config_and_returns_raw() -> None:
     station = _make_station()
     station.bioyond_config.update({"HTTP_host": "127.0.0.1", "HTTP_port": 8090})
@@ -1430,10 +1546,10 @@ def test_rpc_set_ip_config_rejects_blank_ip() -> None:
     rpc_module.requests.put.assert_not_called()
 
 
-# --- plan §Tests 12 + 13: 任何 reset 路径都不调用 take_out / refresh_material_cache ---
+# --- reset: 不调用 take_out / legacy refresh；库位复位成功后走全量物料同步 ---
 
 
-def test_reset_paths_do_not_call_take_out_or_material_cache() -> None:
+def test_reset_paths_do_not_call_take_out_or_legacy_material_cache_refresh() -> None:
     station = _make_station()
     rpc = station.hardware_interface
     rpc.scheduler_reset.return_value = 1
@@ -1449,6 +1565,26 @@ def test_reset_paths_do_not_call_take_out_or_material_cache() -> None:
     refresh = getattr(rpc, "refresh_material_cache", None)
     if refresh is not None and hasattr(refresh, "assert_not_called"):
         refresh.assert_not_called()
+
+
+def test_reset_location_success_syncs_materials_and_publishes() -> None:
+    station = _make_station()
+    rpc = station.hardware_interface
+    rpc.scheduler_reset.return_value = 1
+    rpc.reset_order_status.return_value = 1
+    rpc.reset_location.return_value = 1
+    synchronizer = MagicMock()
+    synchronizer.sync_from_external.return_value = True
+    synchronizer.last_sync_result = {"fetched_count": 1, "converted_count": 1}
+    station.resource_synchronizer = synchronizer
+    station._publish_material_tree_update = MagicMock(return_value=True)
+
+    out = station.reset_auto()
+
+    assert out["material_sync"]["success"] is True
+    assert out["material_sync"]["clear_stale"] is True
+    synchronizer.sync_from_external.assert_called_once_with(clear_stale=True)
+    station._publish_material_tree_update.assert_called_once_with("manual_full_sync")
 
 
 # --- 失败/兜底用例：不 fail-fast，单步异常或 code!=1 仅记 warning ---

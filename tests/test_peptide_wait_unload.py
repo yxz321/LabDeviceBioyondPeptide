@@ -35,6 +35,7 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -242,9 +243,34 @@ def test_process_order_finish_report_records_state_and_sets_event_on_match() -> 
     assert station.last_order_report == {"orderCode": "EXP-0001", "status": "30"}
     assert station.last_used_materials == used
     assert isinstance(result, dict)
-    if "from_super" not in result:
-        assert result.get("processed") is False
-        assert "error" in result and result["error"]
+    assert result.get("processed") is True
+    assert result.get("materials_count") == 1
+
+
+def test_process_order_finish_report_uses_waiting_order_id_for_material_sync() -> None:
+    station = _fresh_station()
+    station.last_order_code = "EXP-0001"
+    station.last_order_id = "OID-0001"
+    material_sync = {
+        "requested": True,
+        "status": "synced",
+        "order_id": "OID-0001",
+        "materials": [],
+        "material_count": 0,
+    }
+    station._sync_order_materials_from_bioyond = MagicMock(return_value=material_sync)
+
+    result = station.process_order_finish_report(
+        _ReportRequest({"orderCode": "EXP-0001", "status": "30"}),
+        [],
+    )
+
+    station._sync_order_materials_from_bioyond.assert_called_once_with(
+        "OID-0001",
+        reason="order_finish_report",
+    )
+    assert result["material_sync"] == material_sync
+    assert station.last_order_material_sync == material_sync
 
 
 def test_process_order_finish_report_does_not_set_event_on_mismatch() -> None:
@@ -476,6 +502,50 @@ def test_wait_for_order_finish_uses_order_id_when_calling_materials_by_order_id(
         {"whName": "自动化堆栈", "locationCode": "1-1", "materialName": "样品A", "quantity": "1"}
     ]
     assert result["used_materials"] == [{"materialId": "mat-1", "usedQuantity": 1}]
+
+
+def test_wait_for_order_finish_retries_when_callback_material_sync_failed() -> None:
+    station = _fresh_station()
+    station.hardware_interface = _FakeRPCForWait()
+    retry_sync = {
+        "requested": True,
+        "status": "synced",
+        "order_id": "OID-1",
+        "materials": [{"id": "m-retry", "name": "重试物料", "quantity": 1, "locations": []}],
+        "material_count": 1,
+    }
+    station._construct_unload_table_payload = MagicMock(return_value={
+        "materials_by_order_id": retry_sync["materials"],
+        "resultTable": {"data": [{"materialName": "重试物料"}], "columns": []},
+        "material_sync": retry_sync,
+    })
+
+    class _TriggeredEvent:
+        def clear(self) -> None:
+            pass
+
+        def wait(self, timeout: Optional[float] = None) -> bool:
+            station.last_order_report = {"orderCode": "EXP-001", "status": "30"}
+            station.last_order_material_sync = {
+                "requested": True,
+                "status": "failed",
+                "order_id": "OID-1",
+                "error": "temporary",
+            }
+            return True
+
+    station.order_finish_event = _TriggeredEvent()
+
+    result = station.wait_for_order_finish(
+        order_id="OID-1",
+        order_code="EXP-001",
+        timeout_seconds=2,
+        poll_mode=False,
+    )
+
+    station._construct_unload_table_payload.assert_called_once_with("OID-1")
+    assert result["material_sync"] == retry_sync
+    assert result["materials_by_order_id"] == retry_sync["materials"]
 
 
 def test_wait_for_order_finish_returns_sorted_unload_result_table() -> None:
