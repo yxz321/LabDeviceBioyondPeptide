@@ -399,6 +399,7 @@ class _PeptideOneSlotMaterialHolder(ItemizedCarrier):
 )
 class BioyondPeptide_1000ul_TipRack(_PeptideTipRack):
     resource_id = "bioyond_peptide_1000ul_tip_rack"
+    bioyond_material_type_code = "0009"
     tip_max_volume_ul = 1000.0
     tip_total_length = 55.0
     tip_fitting_depth = 8.0
@@ -422,6 +423,7 @@ class BioyondPeptide_1000ul_TipRack(_PeptideTipRack):
 )
 class BioyondPeptide_200ul_TipRack(_PeptideTipRack):
     resource_id = "bioyond_peptide_200ul_tip_rack"
+    bioyond_material_type_code = "0008"
     tip_max_volume_ul = 200.0
     tip_total_length = 52.0
     tip_fitting_depth = 5.0
@@ -445,6 +447,7 @@ class BioyondPeptide_200ul_TipRack(_PeptideTipRack):
 )
 class BioyondPeptide_50ul_TipRack(_PeptideTipRack):
     resource_id = "bioyond_peptide_50ul_tip_rack"
+    bioyond_material_type_code = "0012"
     tip_max_volume_ul = 50.0
     tip_total_length = 50.0
     tip_fitting_depth = 5.0
@@ -468,6 +471,7 @@ class BioyondPeptide_50ul_TipRack(_PeptideTipRack):
 )
 class BioyondPeptide_96WellDeepWellPlate(_PeptidePlate):
     resource_id = "bioyond_peptide_96_well_deep_well_plate"
+    bioyond_material_type_code = "0011"
     ordered_items_builder = staticmethod(lambda: _make_96_well_plate_ordered_items(deep=True))
     visual_metadata = {
         "body_color": "#DDE7EA",
@@ -487,6 +491,7 @@ class BioyondPeptide_96WellDeepWellPlate(_PeptidePlate):
 )
 class BioyondPeptide_96WellSynthesisPlate(_PeptidePlate):
     resource_id = "bioyond_peptide_96_well_synthesis_plate"
+    bioyond_material_type_code = "0001"
     ordered_items_builder = staticmethod(lambda: _make_96_well_plate_ordered_items(deep=True))
     visual_metadata = {
         "body_color": "#F2F0E8",
@@ -530,6 +535,7 @@ class BioyondPeptide_96WellCollectionPlate(_PeptidePlate):
 )
 class BioyondPeptide_96WellSynthesisPlateBase(_PeptideOneSlotMaterialHolder):
     resource_id = "bioyond_peptide_96_well_synthesis_plate_base"
+    bioyond_material_type_code = "0039"
     visual_metadata = {
         "body_color": "#555B61",
         "texture": "opaque adapter base",
@@ -543,6 +549,7 @@ class BioyondPeptide_96WellSynthesisPlateBase(_PeptideOneSlotMaterialHolder):
 )
 class BioyondPeptide_96WellBalancePlate(_PeptidePlate):
     resource_id = "bioyond_peptide_96_well_balance_plate"
+    bioyond_material_type_code = "0002"
     ordered_items_builder = staticmethod(lambda: _make_96_well_plate_ordered_items(deep=False))
     visual_metadata = {
         "body_color": "#D8E3EA",
@@ -578,6 +585,7 @@ class BioyondPeptide_96WellAssayPlate(_PeptidePlate):
 )
 class BioyondPeptide_384WellPlate(_PeptidePlate):
     resource_id = "bioyond_peptide_384_well_plate"
+    bioyond_material_type_code = "0018"
     ordered_items_builder = staticmethod(_make_384_well_plate_ordered_items)
     visual_metadata = {
         "body_color": "#EAF2F4",
@@ -653,6 +661,7 @@ class BioyondPeptide_384CarboxylicAcidPlate(_PeptidePlate):
 )
 class BioyondPeptide_384LCMSPlate(_PeptidePlate):
     resource_id = "bioyond_peptide_384_lcms_plate"
+    bioyond_material_type_code = "0049"
     ordered_items_builder = staticmethod(_make_384_well_plate_ordered_items)
     visual_metadata = {
         "body_color": "#EAF2F4",
@@ -668,6 +677,7 @@ class BioyondPeptide_384LCMSPlate(_PeptidePlate):
 )
 class BioyondPeptide_384BalancePlate(_PeptidePlate):
     resource_id = "bioyond_peptide_384_balance_plate"
+    bioyond_material_type_code = "0026"
     ordered_items_builder = staticmethod(_make_384_well_plate_ordered_items)
     visual_metadata = {
         "body_color": "#D8E3EA",
@@ -723,6 +733,7 @@ class BioyondPeptide_96WellStandardCurveAssayPlate(_PeptidePlate):
 )
 class BioyondPeptide_CoverPlate(_PeptidePassiveLabware):
     resource_id = "bioyond_peptide_cover_plate"
+    bioyond_material_type_code = "0035"
     visual_metadata = {
         "body_color": "#B7791F",
         "texture": "translucent cover",
@@ -741,6 +752,7 @@ class BioyondPeptide_CoverPlate(_PeptidePassiveLabware):
 )
 class BioyondPeptide_SealingBase(_PeptidePassiveLabware):
     resource_id = "bioyond_peptide_sealing_base"
+    bioyond_material_type_code = "0041"
     visual_metadata = {
         "body_color": "#555B61",
         "texture": "opaque adapter base",

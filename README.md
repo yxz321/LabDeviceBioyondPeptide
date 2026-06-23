@@ -48,10 +48,9 @@ unilab --check_mode --devices ./bioyond_peptide_station --external_devices_only
 pytest tests/
 
 # 5. 带示例图启动
-unilab --devices ../LabDeviceBioyondPeptide/bioyond_peptide_station --external_devices_only \
-       --ak ba43b4b9-53f3-4400-9fde-70c4a76bfe1f --sk ebbfc986-8f5f-4d97-9779-07e0b5f50c02 --upload_registry --addr test --disable_browser \
-       -g ../LabDeviceBioyondPeptide/examples/peptide_station_graph.with_bioyond_devices.json
-unilab -g test/experiments/comprehensive_protocol/comprehensive_station.json --ak ba43b4b9-53f3-4400-9fde-70c4a76bfe1f --sk ebbfc986-8f5f-4d97-9779-07e0b5f50c02 --upload_registry --addr test --disable_browser
+unilab --devices ./bioyond_peptide_station --external_devices_only \
+       --ak xxx --sk xxx --upload_registry --addr test --disable_browser \
+       -g ./examples/peptide_station_graph.with_bioyond_devices.json
 ```
 
 > 依赖自动安装：unilabos 启动时检测 `--devices` 目录下的 `requirements.txt`，缺失包通过 `uv`（优先）或 `pip` 自动安装。
