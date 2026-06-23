@@ -32,4 +32,4 @@ jobs:
       - name: Validate device registry
         shell: bash -el {0}
         run: |
-          unilab --check_mode --devices ./device_package_example --external_devices_only
+          unilab --check_mode --devices ./bioyond_peptide_station --external_devices_only

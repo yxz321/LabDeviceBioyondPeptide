@@ -1,1 +1,3 @@
-rich
+requests
+pydantic
+typing_extensions

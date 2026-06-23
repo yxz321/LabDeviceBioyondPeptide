@@ -1,0 +1,126 @@
+{
+  "nodes": [
+    {
+      "id": "bioyond_peptide_station",
+      "name": "bioyond_peptide_station",
+      "type": "device",
+      "class": "bioyond_peptide_station",
+      "parent": null,
+      "pose": {
+        "layout": "x-y",
+        "position": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        },
+        "position_3d": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        },
+        "size": {
+          "width": 220,
+          "height": 80,
+          "depth": 1500
+        },
+        "scale": {
+          "x": 1,
+          "y": 1,
+          "z": 1
+        },
+        "rotation": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        },
+        "extra": null,
+        "cross_section_type": "rectangle"
+      },
+      "config": {
+        "config_path": "examples/peptide_station_config.example.json",
+        "protocol_type": [],
+        "deck": {
+          "data": {
+            "_resource_child_name": "Bioyond_Peptide_Deck",
+            "_resource_type": "bioyond_peptide_station.resources.decks:BIOYOND_PeptideStation_Deck"
+          }
+        },
+        "debug_log": true,
+        "debug_log_dir": "temp_benyao/peptide/api_logs",
+        "size_x": 220.0,
+        "size_y": 80.0,
+        "size_z": 1500.0
+      },
+      "data": {},
+      "schema": {},
+      "description": "Bioyond 多肽合成工作站",
+      "model": null,
+      "children": [
+        "Bioyond_Peptide_Deck"
+      ],
+      "position": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      }
+    },
+    {
+      "id": "Bioyond_Peptide_Deck",
+      "name": "Bioyond_Peptide_Deck",
+      "type": "deck",
+      "class": "BIOYOND_PeptideStation_Deck",
+      "parent": "bioyond_peptide_station",
+      "pose": {
+        "layout": "x-y",
+        "position": {
+          "x": 0,
+          "y": -140,
+          "z": 0
+        },
+        "position_3d": {
+          "x": 0,
+          "y": -140,
+          "z": 0
+        },
+        "size": {
+          "width": 2700,
+          "height": 2000,
+          "depth": 1500
+        },
+        "scale": {
+          "x": 1,
+          "y": 1,
+          "z": 1
+        },
+        "rotation": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        },
+        "extra": null,
+        "cross_section_type": "rectangle"
+      },
+      "config": {
+        "type": "BIOYOND_PeptideStation_Deck",
+        "setup": true,
+        "rotation": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "type": "Rotation"
+        }
+      },
+      "data": {},
+      "schema": {},
+      "description": "",
+      "model": null,
+      "children": [],
+      "position": {
+        "x": 0,
+        "y": -140,
+        "z": 0
+      }
+    }
+  ],
+  "edges": []
+}
