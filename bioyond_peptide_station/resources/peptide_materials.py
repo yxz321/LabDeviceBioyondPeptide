@@ -191,22 +191,26 @@ def _make_96_well_plate_ordered_items(deep: bool = False) -> dict[str, Well]:
 
 
 def _make_384_well_plate_ordered_items() -> dict[str, Well]:
-    return create_ordered_items_2d(
-        Well,
-        num_items_x=24,
-        num_items_y=16,
-        dx=10.43,
-        dy=7.29,
-        dz=1.7,
-        item_dx=4.5,
-        item_dy=4.5,
-        size_x=3.4,
-        size_y=3.4,
-        size_z=10.0,
-        max_volume=120,
-        cross_section_type=CrossSectionType.CIRCLE,
-        bottom_type=WellBottomType.FLAT,
-    )
+    # 暂时不生成 384 个 well：完整 well 几何使资源树序列化体积过大，拖垮前后端通信。
+    # 返回空 dict，使 384 孔板序列化为零子节点的空板（PLR 接受空 ordered_items）。
+    # 如需恢复 384 个孔，取消下方注释并删除 `return {}`。
+    return {}
+    # return create_ordered_items_2d(
+    #     Well,
+    #     num_items_x=24,
+    #     num_items_y=16,
+    #     dx=10.43,
+    #     dy=7.29,
+    #     dz=1.7,
+    #     item_dx=4.5,
+    #     item_dy=4.5,
+    #     size_x=3.4,
+    #     size_y=3.4,
+    #     size_z=10.0,
+    #     max_volume=120,
+    #     cross_section_type=CrossSectionType.CIRCLE,
+    #     bottom_type=WellBottomType.FLAT,
+    # )
 
 
 def _make_12_lane_trough_ordered_items() -> dict[str, Well]:
@@ -298,19 +302,25 @@ class _PeptideTipRack(TipRack):
         kwargs.setdefault("size_y", 85.48)
         kwargs.setdefault("size_z", 67.0)
         kwargs.setdefault("category", "tip_rack")
-        kwargs.setdefault("with_tips", True)
+        # 暂时不生成 96 个 tip spot / tip：完整 tip 几何使资源树序列化体积过大，
+        # 拖垮前后端通信。改为传入空 ordering，使 tip rack 序列化为零子节点的空架
+        # （PLR 要求 ordered_items / ordering 至少给一个，故不能两者都省）。
+        # 如需恢复带 tip 的行为，删除下方 ordering 默认并取消 _set_default_ordered_items 注释，
+        # 同时将 with_tips 设回 True。
+        kwargs.setdefault("with_tips", False)
+        kwargs.setdefault("ordering", OrderedDict())
         if self.resource_id is not None:
             kwargs.setdefault("model", self.resource_id)
-        _set_default_ordered_items(
-            kwargs,
-            lambda: _make_tip_spots(
-                self.tip_max_volume_ul,
-                self.tip_total_length,
-                self.tip_fitting_depth,
-                self.tip_dx,
-                self.tip_dy,
-            ),
-        )
+        # _set_default_ordered_items(
+        #     kwargs,
+        #     lambda: _make_tip_spots(
+        #         self.tip_max_volume_ul,
+        #         self.tip_total_length,
+        #         self.tip_fitting_depth,
+        #         self.tip_dx,
+        #         self.tip_dy,
+        #     ),
+        # )
         super().__init__(*args, **kwargs)
         _merge_metadata(self, extra)
 
