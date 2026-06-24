@@ -1116,8 +1116,10 @@ class BioyondWorkstation(WorkstationBase):
         candidate = configured or default_dir or "bioyond_debug_records"
         path = Path(candidate)
         if not path.is_absolute():
-            repo_root = Path(__file__).resolve().parents[4]
-            path = repo_root / path
+            # 本包是外部设备包，安装路径深度不固定（旧 monorepo 的 parents[4]
+            # 在浅路径如 D:\LabDeviceBioyondPeptide 下会 IndexError）。相对
+            # debug_log_dir 一律以 unilab 启动时的工作目录为基准。
+            path = Path.cwd() / path
         return path
 
     def _ensure_debug_log_state(self) -> None:

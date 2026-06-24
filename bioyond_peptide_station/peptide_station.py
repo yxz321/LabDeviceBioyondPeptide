@@ -31,7 +31,10 @@ except Exception:  # pragma: no cover
         return kwargs
 
 if __package__ in {None, ""}:
-    repo_root = Path(__file__).resolve().parents[5]
+    # 直接以脚本方式运行时，把包父目录（含 bioyond_peptide_station/）加入 sys.path，
+    # 使 `import bioyond_peptide_station...` 可用。外部包布局下父目录是 parents[1]
+    # （旧 monorepo 的 parents[5] 在浅路径下会 IndexError）。
+    repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
