@@ -10,7 +10,13 @@ from urllib.error import URLError
 
 import pytest
 
-from unilabos.devices.workstation.workstation_http_service import WorkstationHTTPHandler, WorkstationHTTPService
+# 重要：使用本包 *vendored* 的 HTTP 服务（已修复 material-change 委托），
+# 不是已安装的 unilabos 版本（后者的 bioyond 分支 ack 后直接 return，从不调用
+# process_material_change_report）。
+from bioyond_peptide_station._vendored.workstation_http_service import (
+    WorkstationHTTPHandler,
+    WorkstationHTTPService,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +98,8 @@ def _wait_for_health(url: str) -> None:
 
 
 def test_real_http_service_replays_bioyond_material_change_log() -> None:
+    if not MATERIAL_CHANGE_LOG.exists():
+        pytest.skip(f"material_change 日志夹具缺失（monorepo 依赖）: {MATERIAL_CHANGE_LOG}")
     endpoint, body, material_row = _load_first_material_change_report()
     workstation = _FakeWorkstation()
     service, port = _start_service(workstation)

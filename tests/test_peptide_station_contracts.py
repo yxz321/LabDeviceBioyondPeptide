@@ -85,6 +85,40 @@ class _FakeMaterialSynchronizer:
     def __init__(self) -> None:
         self.cache: Dict[str, Dict[str, Any]] = {}
 
+    # --- helpers process_material_change_report 现在会调用（移动优先 upsert）---
+    @staticmethod
+    def _normalize_source(source: str) -> str:
+        return str(source or "material_change")
+
+    @staticmethod
+    def normalize_material_aliases(material: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(material, dict):
+            return material
+        normalized = dict(material)
+        for target, aliases in (
+            ("id", ("materialId", "material_id", "bioyond_id")),
+            ("name", ("materialName", "material_name")),
+            ("code", ("materialCode", "barCode", "material_code")),
+            ("typeName", ("materialTypeName",)),
+        ):
+            if normalized.get(target):
+                continue
+            for alias in aliases:
+                if normalized.get(alias):
+                    normalized[target] = normalized[alias]
+                    break
+        return normalized
+
+    @staticmethod
+    def _material_bioyond_id(material: Dict[str, Any]) -> str:
+        return str(
+            material.get("id")
+            or material.get("materialId")
+            or material.get("material_id")
+            or material.get("bioyond_id")
+            or ""
+        ).strip()
+
     def _resolve_material_payloads(self, materials: List[Dict[str, Any]], source: str) -> List[Dict[str, Any]]:
         return [dict(item, _source=source) for item in materials]
 
@@ -92,6 +126,7 @@ class _FakeMaterialSynchronizer:
         self,
         materials: List[Dict[str, Any]],
         source: str = "stock-material",
+        source_scope: Any = None,
     ) -> Dict[str, int]:
         updated = 0
         for material in materials:
@@ -112,6 +147,10 @@ def _make_station() -> Any:
     rpc.host = "http://test"
     rpc.api_key = "k"
     rpc.material_info.return_value = {"locations": [{"whName": "自动化堆栈", "code": "1-01"}]}
+    # 同步路径已切到 result-aware 取数：默认空成功，避免 MagicMock 自动属性
+    # 让 _sync_order_materials_from_bioyond 误判 ok / data 形状。需要返回行的
+    # 用例自行覆盖 return_value。
+    rpc.materials_by_order_id_result.return_value = {"ok": True, "data": [], "message": "", "code": 1}
     station.hardware_interface = rpc
     station.resource_synchronizer = _FakeMaterialSynchronizer()
     return station
@@ -596,15 +635,20 @@ def test_submit_experiment_rejects_day1_alias() -> None:
 def test_submit_experiment_day2_calls_pipeline() -> None:
     station = _make_station()
     _wire_submit_pipeline(station)
-    station.hardware_interface.materials_by_order_id.return_value = [
-        {
-            "materialId": "order-mat-1",
-            "materialName": "订单物料",
-            "materialCode": "0007-00001",
-            "quantity": 1,
-            "locations": [],
-        }
-    ]
+    station.hardware_interface.materials_by_order_id_result.return_value = {
+        "ok": True,
+        "data": [
+            {
+                "materialId": "order-mat-1",
+                "materialName": "订单物料",
+                "materialCode": "0007-00001",
+                "quantity": 1,
+                "locations": [],
+            }
+        ],
+        "message": "",
+        "code": 1,
+    }
     result = station.submit_experiment_day2(
         {"sample_excel_pattern": ""},
         {"parameter_overrides": []},
@@ -619,7 +663,9 @@ def test_submit_experiment_day2_calls_pipeline() -> None:
     assert result["material_registration"]["order_id_sync"]["material_count"] == 1
     assert result["material_registration"]["order_id_sync"]["deck_sync"]["published_count"] == 0
     assert result["materials_by_order_id"][0]["materialId"] == "order-mat-1"
-    order_payload = json.loads(station.hardware_interface.materials_by_order_id.call_args.args[0])
+    order_payload = json.loads(
+        station.hardware_interface.materials_by_order_id_result.call_args.args[0]
+    )
     assert order_payload == {"orderId": ORDER_GUID}
     assert result["sample_excel_relative_path"] == "upload\\sample\\f.xlsx"
 
@@ -636,7 +682,7 @@ def test_submit_experiment_day2_can_skip_order_id_sync() -> None:
     assert result["auto_register_materials"] is False
     assert result["material_registration"]["order_id_sync"]["requested"] is False
     assert result["materials_by_order_id"] == []
-    station.hardware_interface.materials_by_order_id.assert_not_called()
+    station.hardware_interface.materials_by_order_id_result.assert_not_called()
 
 
 def test_submit_experiment_day1_calls_pipeline_and_injects_default_cem_method() -> None:
@@ -908,12 +954,19 @@ def test_take_out_action_rejects_empty_order_id() -> None:
 
 def test_materials_by_order_id_action_uses_order_id_payload() -> None:
     station = _make_station()
-    station.hardware_interface.materials_by_order_id.return_value = [{"id": "m1", "name": "样品A"}]
+    station.hardware_interface.materials_by_order_id_result.return_value = {
+        "ok": True,
+        "data": [{"id": "m1", "name": "样品A"}],
+        "message": "",
+        "code": 1,
+    }
 
     out = station.materials_by_order_id(" OID-1 ")
 
-    station.hardware_interface.materials_by_order_id.assert_called_once()
-    payload = json.loads(station.hardware_interface.materials_by_order_id.call_args.args[0])
+    station.hardware_interface.materials_by_order_id_result.assert_called_once()
+    payload = json.loads(
+        station.hardware_interface.materials_by_order_id_result.call_args.args[0]
+    )
     assert payload == {"orderId": "OID-1"}
     assert out["success"] is True
     assert out["order_id"] == "OID-1"
@@ -925,22 +978,29 @@ def test_materials_by_order_id_action_rejects_empty_order_id() -> None:
     station = _make_station()
     with pytest.raises(ValueError, match="order_id"):
         station.materials_by_order_id("")
-    station.hardware_interface.materials_by_order_id.assert_not_called()
+    station.hardware_interface.materials_by_order_id_result.assert_not_called()
 
 
 def test_construct_unload_table_uses_shared_materials_by_order_id_core() -> None:
     station = _make_station()
-    station.hardware_interface.materials_by_order_id.return_value = [
-        {"id": "m1", "name": "样品A", "quantity": 1, "unit": "个", "locations": [{"code": "2-01", "whName": "WH"}]}
-    ]
+    station.hardware_interface.materials_by_order_id_result.return_value = {
+        "ok": True,
+        "data": [
+            {"id": "m1", "name": "样品A", "quantity": 1, "unit": "个", "locations": [{"code": "2-01", "whName": "WH"}]}
+        ],
+        "message": "",
+        "code": 1,
+    }
 
     out = station.construct_unload_table(" OID-1 ")
 
-    payload = json.loads(station.hardware_interface.materials_by_order_id.call_args.args[0])
+    payload = json.loads(
+        station.hardware_interface.materials_by_order_id_result.call_args.args[0]
+    )
     assert payload == {"orderId": "OID-1"}
     assert out["success"] is True
     assert out["order_id"] == "OID-1"
-    assert out["materials_by_order_id"] == station.hardware_interface.materials_by_order_id.return_value
+    assert out["materials_by_order_id"] == station.hardware_interface.materials_by_order_id_result.return_value["data"]
     assert out["resultTable"]["data"] == [
         {"whName": "WH", "locationCode": "2-01", "materialName": "样品A", "quantity": "1 个"}
     ]
@@ -950,7 +1010,7 @@ def test_construct_unload_table_rejects_empty_order_id() -> None:
     station = _make_station()
     with pytest.raises(ValueError, match="order_id"):
         station.construct_unload_table("")
-    station.hardware_interface.materials_by_order_id.assert_not_called()
+    station.hardware_interface.materials_by_order_id_result.assert_not_called()
 
 
 def test_batch_cancel_experiment_uses_order_codes() -> None:

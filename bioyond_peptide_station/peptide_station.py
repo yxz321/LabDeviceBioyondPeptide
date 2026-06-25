@@ -408,6 +408,58 @@ class BioyondPeptideStation(BioyondWorkstation):
             "sync_result": sync_result,
         }
 
+    @action(
+        always_free=True,
+        goal_default={"order_id": "", "publish_tree": True},
+        description="按订单ID从 Bioyond 同步物料并发布资源树",
+        handles=[
+            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="实验ID", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
+            ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="实验ID", data_key="order_id", data_source=DataSource.EXECUTOR),
+        ],
+    )
+    def sync_materials_from_bioyond_by_order_id(
+        self,
+        order_id: str,
+        publish_tree: bool = True,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """按订单ID从 Bioyond 同步物料（move-优先 upsert），并发布资源树。
+
+        Args:
+            order_id: Bioyond LIMS 订单 UUID（不是 orderCode/实验编号）。
+            publish_tree: 同步成功后是否发布整棵 deck 资源树到 UniLabOS。
+        """
+        del kwargs
+        with self._debug_call_session("sync_materials_from_bioyond_by_order_id"):
+            sync_result = self._sync_order_materials_from_bioyond(
+                order_id,
+                reason="manual_order_sync",
+            )
+        synced = bool(sync_result.get("success"))
+        published = False
+        if synced and publish_tree:
+            publisher = getattr(self, "_publish_material_tree_update", None)
+            if callable(publisher):
+                published = bool(publisher("manual_order_sync"))
+            else:
+                logger.warning(
+                    "[sync_materials_from_bioyond_by_order_id] 资源树发布接口不可用"
+                )
+
+        return {
+            "success": synced,
+            "action": "sync_materials_from_bioyond_by_order_id",
+            "message": (
+                "Bioyond 订单物料同步完成"
+                if synced
+                else (sync_result.get("message") or "Bioyond 订单物料同步失败")
+            ),
+            "order_id": str(order_id or "").strip(),
+            "published": published,
+            "publish_requested": bool(publish_tree),
+            "sync_result": sync_result,
+        }
+
     def _debug_call_session(self, action_name: str):
         parent_debug_session = getattr(super(), "_debug_call_session", None)
         if parent_debug_session is not None:
@@ -1642,10 +1694,12 @@ class BioyondPeptideStation(BioyondWorkstation):
             post_take_out_sync: Dict[str, Any] = {"requested": False, "status": "skipped"}
             if success:
                 try:
-                    post_take_out_sync = self._sync_order_materials_from_bioyond(
+                    sync_action_result = self.sync_materials_from_bioyond_by_order_id(
                         normalized_order_id,
-                        reason="unload_materials",
+                        publish_tree=True,
                     )
+                    post_take_out_sync = dict(sync_action_result.get("sync_result") or {})
+                    post_take_out_sync["published"] = bool(sync_action_result.get("published"))
                 except Exception as exc:
                     logger.warning(
                         f"[peptide] unload_materials take_out 后订单物料同步失败: "
@@ -1653,14 +1707,13 @@ class BioyondPeptideStation(BioyondWorkstation):
                     )
                     post_take_out_sync = {
                         "requested": True,
+                        "success": False,
                         "status": "failed",
                         "order_id": normalized_order_id,
                         "error": str(exc),
                     }
-                if (
-                    post_take_out_sync.get("status") == "failed"
-                    or (not post_take_out_sync.get("material_count") and order_material_ids)
-                ):
+                # 仅在订单同步 API 失败时回退显式删除（delete-on-empty 已处理成功的空同步）。
+                if not post_take_out_sync.get("success") and order_material_ids:
                     deleted_materials = self._delete_bioyond_materials_from_cache_and_deck(
                         order_material_ids,
                         publish_tree=True,
@@ -1993,24 +2046,29 @@ class BioyondPeptideStation(BioyondWorkstation):
         deleted_materials = {"material_ids": order_material_ids, "removed_from_deck": 0, "removed_from_cache": 0}
         if code == 1:
             try:
-                post_take_out_sync = self._sync_order_materials_from_bioyond(
+                # 经由对外暴露的同步 action（move-优先 upsert + 发布）。
+                # 该路径已用 on_empty_locations="delete" 删除 []-in-return 行，
+                # 因此成功（含真空）时无需再走 _delete_* 兜底，避免重复删除。
+                sync_action_result = self.sync_materials_from_bioyond_by_order_id(
                     normalized_order_id,
-                    reason="take_out",
+                    publish_tree=True,
                 )
+                post_take_out_sync = dict(sync_action_result.get("sync_result") or {})
+                post_take_out_sync["published"] = bool(sync_action_result.get("published"))
             except Exception as exc:
                 logger.warning(
                     f"[peptide] take_out 后订单物料同步失败: order_id={normalized_order_id} error={exc}"
                 )
                 post_take_out_sync = {
                     "requested": True,
+                    "success": False,
                     "status": "failed",
                     "order_id": normalized_order_id,
                     "error": str(exc),
                 }
-            if (
-                post_take_out_sync.get("status") == "failed"
-                or (not post_take_out_sync.get("material_count") and order_material_ids)
-            ):
+            # 仅在订单同步 API 失败时回退到显式删除（保留安全行为）。
+            # 成功的空同步不再触发兜底，否则会与 delete-on-empty 重复删除。
+            if not post_take_out_sync.get("success") and order_material_ids:
                 deleted_materials = self._delete_bioyond_materials_from_cache_and_deck(
                     order_material_ids,
                     publish_tree=True,
@@ -2969,11 +3027,18 @@ class BioyondPeptideStation(BioyondWorkstation):
         *,
         reason: str,
     ) -> Dict[str, Any]:
-        """按订单拉取物料，按 delete/change/add 顺序更新本地资源树。"""
+        """按订单拉取物料，按 delete/change/add 顺序更新本地资源树。
+
+        使用 result-aware 取物料：API 失败时返回 ``status="failed"`` 且不触碰
+        cache/deck；成功（含真空返回）时构建一次 ``lookup`` map 并以
+        ``on_empty_locations="delete"`` 调用 upsert（删除 ``locations==[]`` 行，
+        不做 delete-absent 扫描）。
+        """
         normalized_order_id = str(order_id or "").strip()
         if not normalized_order_id:
             return {
                 "requested": False,
+                "success": False,
                 "status": "skipped",
                 "reason": "missing_order_id",
                 "materials": [],
@@ -2981,16 +3046,65 @@ class BioyondPeptideStation(BioyondWorkstation):
                 "mutations": [],
             }
 
-        materials = self._fetch_materials_by_order_id(normalized_order_id)
+        # ---- result-aware 取数：API 失败 short-circuit，不更新 cache/deck ----
+        rpc = self._require_hardware_interface("materials_by_order_id_result")
+        payload = {"orderId": normalized_order_id}
+        with self._debug_call_session("materials_by_order_id_result"):
+            fetch_result = rpc.materials_by_order_id_result(
+                json.dumps(payload, ensure_ascii=False)
+            )
+        if not isinstance(fetch_result, dict) or not fetch_result.get("ok"):
+            message = (
+                fetch_result.get("message")
+                if isinstance(fetch_result, dict)
+                else "materials_by_order_id_result 返回非 dict"
+            ) or "Bioyond 订单物料查询失败"
+            logger.warning(
+                f"[peptide] 订单物料同步失败(API): order_id={normalized_order_id} "
+                f"reason={reason} message={message}"
+            )
+            return {
+                "requested": True,
+                "success": False,
+                "status": "failed",
+                "reason": reason,
+                "order_id": normalized_order_id,
+                "message": message,
+                "code": fetch_result.get("code") if isinstance(fetch_result, dict) else None,
+                "materials": [],
+                "material_count": 0,
+                "mutations": [],
+                "published_count": 0,
+            }
+
+        materials = [item for item in (fetch_result.get("data") or []) if isinstance(item, dict)]
+        # 成功返回（含真空）才写 durable cache。
+        self._cache_order_materials(
+            materials,
+            source="materials_by_order_id",
+            order_id=normalized_order_id,
+        )
+
         normalized_materials = [
             self._normalize_order_material_payload(material, order_id=normalized_order_id)
             for material in materials
-            if isinstance(material, dict)
         ]
+
+        # 整批只走一次 deck，lookup 在 upsert 内被原地更新，供后续行复用。
+        lookup = self._build_bioyond_lookup_map()
+
         mutation_results: List[Dict[str, Any]] = []
         for material in sorted(normalized_materials, key=self._order_material_mutation_rank):
             try:
-                mutation_results.append(self.process_material_change_report(material))
+                mutation_results.append(
+                    self.process_material_change_report(
+                        material,
+                        on_empty_locations="delete",
+                        source="order_materials",
+                        source_scope=normalized_order_id,
+                        lookup=lookup,
+                    )
+                )
             except Exception as exc:
                 logger.warning(
                     f"[peptide] 订单物料资源树更新失败: order_id={normalized_order_id} "
@@ -2998,19 +3112,30 @@ class BioyondPeptideStation(BioyondWorkstation):
                 )
                 mutation_results.append({
                     "processed": False,
+                    "success": False,
                     "material_id": self._material_id_from_any(material),
                     "error": str(exc),
                 })
 
+        all_ok = all(item.get("processed") for item in mutation_results)
+        action_counts: Dict[str, int] = {}
+        for item in mutation_results:
+            action = str(item.get("action") or "")
+            if action:
+                action_counts[action] = action_counts.get(action, 0) + 1
+
         return {
             "requested": True,
-            "status": "synced" if all(item.get("processed") for item in mutation_results) else "partial",
+            "success": True,
+            "status": "synced" if all_ok else "partial",
             "reason": reason,
             "order_id": normalized_order_id,
             "materials": materials,
             "material_count": len(materials),
             "mutations": mutation_results,
             "published_count": sum(1 for item in mutation_results if item.get("published")),
+            "action_counts": action_counts,
+            "failures": [item for item in mutation_results if not item.get("processed")],
         }
 
     def _construct_unload_table_payload(self, order_id: str) -> Dict[str, Any]:

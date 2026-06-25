@@ -37,7 +37,7 @@ from typing import get_origin
 from unilabos.resources.graphio import initialize_resource
 
 
-def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[str, Tuple[str, str]] = {}, deck: Any = None) -> list[dict]:
+def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[str, Tuple[str, str]] = {}, deck: Any = None, lookup: Any = None) -> list[dict]:
     """
     将 bioyond 物料格式转换为 ulab 物料格式
 
@@ -45,11 +45,24 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
         bioyond_materials: bioyond 系统的物料查询结果列表
         type_mapping: 物料类型映射字典，格式 {model: (显示名称, UUID)} 或 {显示名称: (model, UUID)}
         location_id_mapping: 库位 ID 到名称的映射字典，格式 {location_id: location_name}
+        lookup: 可选的组合物料父物料外部解析器，用于在本批次之外（例如已在 deck 上、
+            但不在当前转换批次内）查找父物料。可为 dict（``{bioyond_id: resource}``）或
+            callable（``lookup(bioyond_id) -> Optional[resource]``）。仅作为本批次
+            ``resources_by_bioyond_id`` 查找失败时的后备；为 ``None`` 时行为与旧版完全一致。
 
     Returns:
         pylabrobot 格式的物料列表
     """
     plr_materials = []
+
+    def _resolve_parent(bid):
+        if not bid:
+            return None
+        if callable(lookup):
+            return lookup(bid)
+        if lookup:
+            return lookup.get(bid)
+        return None
 
     # 创建反向映射: {显示名称: (model, UUID)} -> 用于从 Bioyond typeName 查找 model
     # 如果 type_mapping 的 key 已经是显示名称,则直接使用;否则创建反向映射
@@ -646,7 +659,11 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
         combined_parent_id = _combined_parent_id(material)
         if combined_parent_id:
             child_location_key = _first_location_key_from_locations(locations)
+            # 先查本批次（含预扫 deck）的映射，未命中再退回外部 lookup，
+            # 以便父物料已在 deck 上但不在当前批次时也能找到。
             parent = resources_by_bioyond_id.get(combined_parent_id)
+            if parent is None:
+                parent = _resolve_parent(combined_parent_id)
             if parent is not None:
                 parent_location_key = _first_location_key_from_resource(parent)
                 if child_location_key is None or child_location_key == parent_location_key:

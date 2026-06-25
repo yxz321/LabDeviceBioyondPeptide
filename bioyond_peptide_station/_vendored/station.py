@@ -29,7 +29,7 @@ from pylabrobot.resources import ResourceHolder
 from pylabrobot.resources.resource import Resource as ResourcePLR
 
 
-from unilabos.devices.workstation.workstation_http_service import WorkstationHTTPService
+from .workstation_http_service import WorkstationHTTPService
 
 
 class ConnectionMonitor:
@@ -152,104 +152,112 @@ class BioyondResourceSynchronizer(ResourceSynchronizer):
             return False
 
     def sync_from_external(self, clear_stale: bool = False) -> bool:
-        """从Bioyond系统同步物料数据"""
+        """从Bioyond系统全量同步物料数据（移动优先 + 可选删除缺失清扫）。
+
+        - 用 *_result RPC 区分 API 失败 vs 真·空成功；任一必需 typeMode 失败 →
+          返回失败、不改缓存/deck。
+        - 每个返回物料走工作站 process_material_change_report 的 upsert（move 优先，
+          on_empty_locations="park"，source=stock_material，复用并维护瞬态 lookup）。
+        - 仅当 clear_stale：跑删除缺失清扫——删除 deck 上携带 bioyond_id 但不在本次
+          返回集合中的根资源子树（排除仓库与虚拟暂存节点）。
+
+        返回 bool（沿用历史契约）；详细/失败信息写入 self.last_sync_result，
+        失败时 last_sync_result["success"]=False 且带 message。
+        """
         try:
             if self.bioyond_api_client is None:
                 logger.error("Bioyond API客户端未初始化")
-                return False
-
-            # 同时查询耗材类型(typeMode=0)、样品类型(typeMode=1)和试剂类型(typeMode=2)
-            all_bioyond_data = []
-
-            # 查询耗材类型物料（例如：枪头盒）
-            bioyond_data_type0 = self.bioyond_api_client.stock_material('{"typeMode": 0, "includeDetail": true}')
-            if bioyond_data_type0:
-                all_bioyond_data.extend(bioyond_data_type0)
-                logger.debug(f"从Bioyond查询到 {len(bioyond_data_type0)} 个耗材类型物料")
-
-            # 查询样品类型物料（烧杯、试剂瓶、分装板等）
-            bioyond_data_type1 = self.bioyond_api_client.stock_material('{"typeMode": 1, "includeDetail": true}')
-            if bioyond_data_type1:
-                all_bioyond_data.extend(bioyond_data_type1)
-                logger.debug(f"从Bioyond查询到 {len(bioyond_data_type1)} 个样品类型物料")
-
-            # 查询试剂类型物料（样品板、样品瓶等）
-            bioyond_data_type2 = self.bioyond_api_client.stock_material('{"typeMode": 2, "includeDetail": true}')
-            if bioyond_data_type2:
-                all_bioyond_data.extend(bioyond_data_type2)
-                logger.debug(f"从Bioyond查询到 {len(bioyond_data_type2)} 个试剂类型物料")
-
-            if not all_bioyond_data:
-                logger.warning("从Bioyond获取的物料数据为空")
                 self.last_sync_result = {
                     "success": False,
-                    "fetched_count": 0,
-                    "converted_count": 0,
-                    "placed_count": 0,
-                    "removed_stale_count": 0,
-                    "unresolved_count": 0,
+                    "failed": True,
+                    "message": "Bioyond API客户端未初始化",
                 }
                 return False
 
-            all_bioyond_data = self._resolve_material_payloads(
-                all_bioyond_data,
-                source="stock-material",
-            )
-            cache_update = self._update_material_cache_from_stock(
-                all_bioyond_data,
-                source="stock-material",
-            )
+            workstation = self.workstation
+            result_fn = getattr(self.bioyond_api_client, "stock_material_result", None)
+            if not callable(result_fn):
+                self.last_sync_result = {
+                    "success": False,
+                    "failed": True,
+                    "message": "RPC 缺少 stock_material_result（result-aware 变体）",
+                }
+                logger.error("[Bioyond全量同步] RPC 缺少 stock_material_result")
+                return False
 
+            # 必需的 typeMode 集合（沿用历史 0/1/2）。任一失败即整体失败。
+            required_type_modes = [0, 1, 2]
+            all_bioyond_data: List[Dict[str, Any]] = []
+            succeeded_type_modes: List[int] = []
+            for type_mode in required_type_modes:
+                query = json.dumps({"typeMode": type_mode, "includeDetail": True})
+                result = result_fn(query)
+                if not isinstance(result, dict) or not result.get("ok"):
+                    message = (result or {}).get("message") if isinstance(result, dict) else ""
+                    logger.error(
+                        f"[Bioyond全量同步] stock_material typeMode={type_mode} 失败，"
+                        f"不改缓存/deck: {message}"
+                    )
+                    self.last_sync_result = {
+                        "success": False,
+                        "failed": True,
+                        "message": message or f"stock_material typeMode={type_mode} 失败",
+                        "failed_type_mode": type_mode,
+                        "succeeded_type_modes": list(succeeded_type_modes),
+                    }
+                    return False
+                rows = result.get("data") or []
+                succeeded_type_modes.append(type_mode)
+                if rows:
+                    all_bioyond_data.extend(rows)
+                    logger.debug(f"从Bioyond查询到 typeMode={type_mode} 物料 {len(rows)} 个")
+
+            # 解析载荷（补类型/编码元数据），构造瞬态 lookup 映射一次。
+            all_bioyond_data = self._resolve_material_payloads(
+                all_bioyond_data, source=self.SOURCE_STOCK
+            )
+            lookup = workstation._build_bioyond_lookup_map()
+
+            converted_count = 0
+            placed_count = 0
+            returned_ids: set[str] = set()
             publish_roots: List[ResourcePLR] = []
+            for material in all_bioyond_data:
+                material_id = self._material_bioyond_id(material)
+                if material_id:
+                    returned_ids.add(material_id)
+                result = workstation.process_material_change_report(
+                    material,
+                    on_empty_locations="park",
+                    source=self.SOURCE_STOCK,
+                    lookup=lookup,
+                )
+                if result.get("success"):
+                    converted_count += 1
+                    if result.get("action") in ("add", "move"):
+                        placed_count += 1
+
+            # 删除缺失清扫：仅 clear_stale。删除携带 bioyond_id 且不在 returned_ids
+            # 的根资源子树（排除仓库 / 虚拟暂存节点）。
             removed_stale_count = 0
             removed_stale_cache_count = 0
             if clear_stale:
-                clear_existing = getattr(self.workstation, "_clear_external_sync_bioyond_materials", None)
-                if callable(clear_existing):
-                    removed_stale_count = int(clear_existing(publish_roots=publish_roots))
-                removed_stale_cache_count = self._prune_bioyond_material_cache(
-                    {str(item.get("id")) for item in all_bioyond_data if item.get("id")}
+                removed_stale_count = workstation._sweep_absent_bioyond_materials(
+                    returned_ids, publish_roots=publish_roots
                 )
-            else:
-                remove_current = getattr(self.workstation, "_remove_bioyond_materials_from_deck", None)
-                if callable(remove_current):
-                    material_ids = [str(item.get("id")) for item in all_bioyond_data if item.get("id")]
-                    removed_stale_count = int(remove_current(material_ids, publish_roots=publish_roots))
+                removed_stale_cache_count = self._prune_bioyond_material_cache(returned_ids)
 
-            clear_occupants = getattr(self.workstation, "_clear_reported_location_occupants", None)
-            if callable(clear_occupants):
-                for material in all_bioyond_data:
-                    removed_stale_count += int(clear_occupants(material, publish_roots=publish_roots))
-
-            # 转换为UniLab格式
-            unilab_resources = resource_bioyond_to_plr(
-                all_bioyond_data,
-                type_mapping=self.workstation.bioyond_config["material_type_mappings"],
-                deck=self.workstation.deck
-            )
-            reconcile = getattr(self.workstation, "_reconcile_synthesis_plate_bases", None)
-            if callable(reconcile):
-                reconciled = reconcile(unilab_resources)
-                if reconciled:
-                    logger.info(f"从Bioyond全量同步后挂载 {reconciled} 个固相合成板/底座组合")
-            append_publish_root = getattr(self.workstation, "_append_material_publish_root", None)
-            if callable(append_publish_root):
-                for resource in unilab_resources:
-                    append_publish_root(publish_roots, resource)
-
-            converted_count = len(unilab_resources)
-            placed_count = sum(
-                1 for resource in unilab_resources
-                if getattr(resource, "parent", None) is not None
-            )
-            dedupe_roots = getattr(self.workstation, "_dedupe_material_publish_roots", None)
+            dedupe_roots = getattr(workstation, "_dedupe_material_publish_roots", None)
             publish_roots = dedupe_roots(publish_roots) if callable(dedupe_roots) else publish_roots
             try:
-                setattr(self.workstation, "_last_material_sync_publish_roots", publish_roots)
+                setattr(workstation, "_last_material_sync_publish_roots", publish_roots)
             except Exception:
                 pass
+
+            success = True
             self.last_sync_result = {
-                "success": converted_count > 0,
+                "success": success,
+                "failed": False,
                 "fetched_count": len(all_bioyond_data),
                 "converted_count": converted_count,
                 "placed_count": placed_count,
@@ -257,33 +265,96 @@ class BioyondResourceSynchronizer(ResourceSynchronizer):
                 "removed_stale_cache_count": removed_stale_cache_count,
                 "unresolved_count": max(len(all_bioyond_data) - converted_count, 0),
                 "clear_stale": bool(clear_stale),
-                "cache_records_count": cache_update.get("records_count", 0),
-                "cache_updated_count": cache_update.get("updated_count", 0),
+                "succeeded_type_modes": list(succeeded_type_modes),
+                "returned_ids_count": len(returned_ids),
                 "publish_roots_count": len(publish_roots),
+                "message": "Bioyond 物料全量同步完成",
             }
             logger.info(
-                "从Bioyond同步了 %s/%s 个资源，已放置 %s 个，清理旧Bioyond物料 %s 个，clear_stale=%s",
+                "从Bioyond同步了 %s/%s 个资源，放置 %s 个，删除缺失 %s 个，clear_stale=%s",
                 converted_count,
                 len(all_bioyond_data),
                 placed_count,
                 removed_stale_count,
                 clear_stale,
             )
-            return converted_count > 0
+            return success
         except Exception as e:
             logger.exception(f"从Bioyond同步物料数据失败: {e}")
             self.last_sync_result = {
                 "success": False,
+                "failed": True,
                 "error": str(e),
+                "message": str(e),
             }
             return False
+
+    # 源/作用域枚举：用于源感知的缓存簿记。
+    #   stock_material   - 全局库存（typeMode 级权威）
+    #   order_materials  - 单订单返回行（订单级权威）
+    #   material_change  - 实时推送（单物料权威）
+    #   material_info    - material-info(id) 回退（单物料完整状态权威，含 locations）
+    SOURCE_STOCK = "stock_material"
+    SOURCE_ORDER = "order_materials"
+    SOURCE_PUSH = "material_change"
+    SOURCE_MATERIAL_INFO = "material_info"
+
+    # source -> 对应的 last_seen_* 簿记字段。
+    _SOURCE_LAST_SEEN_FIELD = {
+        SOURCE_STOCK: "last_seen_stock_at",
+        SOURCE_ORDER: "last_seen_order_at",
+        SOURCE_PUSH: "last_seen_push_at",
+        SOURCE_MATERIAL_INFO: "last_seen_material_info_at",
+        # 旧别名兼容
+        "stock-material": "last_seen_stock_at",
+    }
+
+    @staticmethod
+    def _normalize_source(source: Optional[str]) -> str:
+        """把旧别名归一化为标准 source 枚举值。"""
+        if source in ("stock-material", "stock_material"):
+            return BioyondResourceSynchronizer.SOURCE_STOCK
+        if source in ("order_materials", "order-materials", "materials_by_order_id"):
+            return BioyondResourceSynchronizer.SOURCE_ORDER
+        if source in ("material_change", "material-change", "push"):
+            return BioyondResourceSynchronizer.SOURCE_PUSH
+        if source in ("material_info", "material-info"):
+            return BioyondResourceSynchronizer.SOURCE_MATERIAL_INFO
+        return str(source or BioyondResourceSynchronizer.SOURCE_PUSH)
+
+    @staticmethod
+    def normalize_material_aliases(material: Dict[str, Any]) -> Dict[str, Any]:
+        """归一化 Bioyond 字段别名（materialId→id 等），不丢弃原 key。
+
+        仅在缺失目标 key 时填充，因此不会覆盖更权威的现有值；不触碰 locations
+        （保留"未知 vs 权威空"差异）。返回浅拷贝。
+        """
+        if not isinstance(material, dict):
+            return material
+        normalized = dict(material)
+        alias_plan = {
+            "id": ("materialId", "material_id", "bioyond_id"),
+            "name": ("materialName", "material_name"),
+            "code": ("materialCode", "barCode", "material_code"),
+            "typeName": ("materialTypeName",),
+            "typeId": ("materialTypeId", "typeUUID"),
+        }
+        for target, aliases in alias_plan.items():
+            if BioyondResourceSynchronizer._has_material_value(normalized, target):
+                continue
+            for alias in aliases:
+                if BioyondResourceSynchronizer._has_material_value(normalized, alias):
+                    normalized[target] = normalized[alias]
+                    break
+        return normalized
 
     def _update_material_cache_from_stock(
         self,
         materials: List[Dict[str, Any]],
-        source: str = "stock-material",
+        source: str = "stock_material",
+        source_scope: Optional[str] = None,
     ) -> Dict[str, int]:
-        """同步旧 name->id 缓存和新的 Bioyond id->record 物料缓存。"""
+        """同步旧 name->id 缓存和新的 Bioyond id->record 物料缓存（源感知）。"""
         material_cache = getattr(self.bioyond_api_client, "material_cache", None)
         if isinstance(material_cache, dict):
             before_count = len(material_cache)
@@ -302,7 +373,9 @@ class BioyondResourceSynchronizer(ResourceSynchronizer):
                 f"已用Bioyond库存同步旧物料名称缓存: {before_count} -> {len(material_cache)}"
             )
 
-        return self._upsert_bioyond_material_cache(materials, source=source)
+        return self._upsert_bioyond_material_cache(
+            materials, source=source, source_scope=source_scope
+        )
 
     def _bioyond_material_cache(self) -> Dict[str, Dict[str, Any]]:
         cache = getattr(self.bioyond_api_client, "bioyond_material_cache", None)
@@ -381,17 +454,30 @@ class BioyondResourceSynchronizer(ResourceSynchronizer):
             logger.debug(f"[Bioyond物料缓存] 构建类型编码映射失败: {exc}")
         return mapping
 
-    def _normalize_material_record(self, material: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
+    def _normalize_material_record(
+        self,
+        material: Dict[str, Any],
+        source: str,
+        source_scope: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         material_id = self._material_bioyond_id(material)
         if not material_id:
             return None
         now = datetime.now().isoformat()
+        norm_source = self._normalize_source(source)
         type_code = self._material_type_code(material)
         type_info = self._material_type_code_mapping().get(type_code, {})
         cache = self._bioyond_material_cache()
         previous = cache.get(material_id, {})
+        if not isinstance(previous, dict):
+            previous = {}
         first_seen_at = previous.get("first_seen_at") or now
-        locations = copy.deepcopy(material.get("locations") or [])
+        # 保留"未知库位 vs 权威空库位"差异：缺失 locations key 时回退到缓存中已知值，
+        # 而非武断当作 []。显式提供（含 []）才覆盖。
+        if "locations" in material:
+            locations = copy.deepcopy(material.get("locations") or [])
+        else:
+            locations = copy.deepcopy(previous.get("locations") or previous.get("bioyond_locations") or [])
         code = self._material_code(material)
         raw_name = self._material_display_name(material)
         raw_type_name = self._clean_material_text(
@@ -402,7 +488,26 @@ class BioyondResourceSynchronizer(ResourceSynchronizer):
         resolved_type_name = type_info.get("resolved_type_name") or raw_type_name
         if regular_container_fallback:
             resolved_type_name = "RegularContainer"
-        return {
+
+        # 簿记：保留各 source 的 last_seen_*，并记录 order_ids_seen。
+        order_ids_seen = list(previous.get("order_ids_seen") or [])
+        scope = self._clean_material_text(source_scope)
+        if norm_source == self.SOURCE_ORDER and scope and scope not in order_ids_seen:
+            order_ids_seen.append(scope)
+        last_seen = {
+            key: previous.get(key)
+            for key in (
+                "last_seen_stock_at",
+                "last_seen_order_at",
+                "last_seen_push_at",
+                "last_seen_material_info_at",
+            )
+        }
+        last_seen_field = self._SOURCE_LAST_SEEN_FIELD.get(norm_source)
+        if last_seen_field:
+            last_seen[last_seen_field] = now
+
+        record = {
             "bioyond_id": material_id,
             "bioyond_name": raw_name,
             "bioyond_typeName": resolved_type_name,
@@ -429,7 +534,9 @@ class BioyondResourceSynchronizer(ResourceSynchronizer):
             "quantity": material.get("quantity"),
             "lockQuantity": material.get("lockQuantity"),
             "unit": material.get("unit"),
-            "source": source,
+            "source": norm_source,
+            "source_scope": scope or None,
+            "order_ids_seen": order_ids_seen,
             "first_seen_at": first_seen_at,
             "updated_at": now,
             "raw_payload": copy.deepcopy(material),
@@ -438,18 +545,21 @@ class BioyondResourceSynchronizer(ResourceSynchronizer):
             "warnings": warnings,
             "unresolved": False,
         }
+        record.update(last_seen)
+        return record
 
     def _upsert_bioyond_material_cache(
         self,
         materials: List[Dict[str, Any]],
         source: str,
+        source_scope: Optional[str] = None,
     ) -> Dict[str, int]:
         cache = self._bioyond_material_cache()
         updated = 0
         for material in materials:
             if not isinstance(material, dict):
                 continue
-            record = self._normalize_material_record(material, source)
+            record = self._normalize_material_record(material, source, source_scope=source_scope)
             if not record:
                 continue
             cache[record["bioyond_id"]] = record
@@ -545,6 +655,27 @@ class BioyondResourceSynchronizer(ResourceSynchronizer):
             logger.warning(f"[Bioyond物料缓存] material-info 查询失败: id={material_id} error={exc}")
             return {}
         return info if isinstance(info, dict) else {}
+
+    def material_info_result(self, material_id: str) -> Dict[str, Any]:
+        """material-info(id) 的非折叠结果封装。
+
+        返回 {"ok": bool, "data": dict, "message": str, "code": int|None}。
+        优先调用 RPC 的 material_info_result（区分 API 失败 vs 真·空），缺失时回退到
+        旧 material_info（仅能返回 data）。API 失败时 ok=False，调用方据此短路、不改 deck。
+        """
+        client = self.bioyond_api_client
+        result_fn = getattr(client, "material_info_result", None)
+        if callable(result_fn):
+            try:
+                result = result_fn(material_id) or {}
+            except Exception as exc:
+                return {"ok": False, "data": {}, "message": str(exc), "code": None}
+            if isinstance(result, dict) and "ok" in result:
+                data = result.get("data")
+                result["data"] = data if isinstance(data, dict) else {}
+                return result
+        info = self._fetch_material_info_for_cache(material_id)
+        return {"ok": bool(info), "data": info, "message": "", "code": 1 if info else None}
 
     def _resolve_material_payloads(
         self,
@@ -2132,6 +2263,48 @@ class BioyondWorkstation(WorkstationBase):
                 )
         return removed
 
+    def _sweep_absent_bioyond_materials(
+        self,
+        returned_ids: set,
+        publish_roots: Optional[List[ResourcePLR]] = None,
+    ) -> int:
+        """删除缺失清扫：删除 deck 上携带 bioyond_id 但不在 returned_ids 的根资源子树。
+
+        复用 _clear_external_sync_bioyond_materials 的根级过滤；显式排除仓库与虚拟
+        暂存节点（按身份/名称，不靠模糊判断）。不独立删除无 bioyond_id 的资源——它们
+        只随祖先子树级联删除。returned_ids 为空集（真·空成功）时删除全部 bioyond_id 根。
+        """
+        deck = getattr(self, "deck", None)
+        if deck is None:
+            return 0
+        wanted = {str(material_id).strip() for material_id in (returned_ids or set()) if str(material_id or "").strip()}
+
+        candidates = [
+            resource
+            for resource in self._iter_resource_subtree(deck)
+            if resource is not deck
+            and self._resource_bioyond_id(resource)
+            and not self._is_virtual_holding_node(resource)
+            and getattr(resource, "category", "") != "warehouse"
+        ]
+        candidate_ids = {id(resource) for resource in candidates}
+        roots = [
+            resource
+            for resource in candidates
+            if not self._has_bioyond_id_ancestor(resource, candidate_ids)
+            and self._resource_bioyond_id(resource) not in wanted
+        ]
+        removed = 0
+        for resource in roots:
+            bioyond_id = self._resource_bioyond_id(resource)
+            if self._remove_resource_subtree(resource, publish_roots=publish_roots):
+                removed += 1
+                logger.info(
+                    f"[Bioyond删除缺失清扫] 删除不在返回集合的旧物料: "
+                    f"id={bioyond_id} name={getattr(resource, 'name', None)}"
+                )
+        return removed
+
     def _remove_bioyond_materials_from_deck(
         self,
         material_ids: List[str],
@@ -2336,6 +2509,264 @@ class BioyondWorkstation(WorkstationBase):
             if self._resource_bioyond_id(resource) == wanted:
                 return resource
         return None
+
+    # ----- 虚拟暂存节点 (limbo) 与批次 lookup -------------------------------
+
+    @staticmethod
+    def _virtual_holding_node_name() -> str:
+        """虚拟暂存节点名称。优先复用 decks 模块常量，导入失败时回退到同值字面量。
+
+        懒导入以规避 resources.decks -> _vendored 的潜在循环依赖。
+        """
+        try:
+            from ..resources.decks import BIOYOND_VIRTUAL_HOLDING_NODE_NAME
+            return BIOYOND_VIRTUAL_HOLDING_NODE_NAME
+        except Exception:
+            return "BioyondVirtualHolding"
+
+    def _is_virtual_holding_node(self, resource: ResourcePLR) -> bool:
+        return getattr(resource, "name", "") == self._virtual_holding_node_name()
+
+    def _ensure_virtual_holding_node(self) -> Optional[ResourcePLR]:
+        """返回 deck 上的虚拟暂存节点；缺失时尽量创建。
+
+        - 先按名称在 deck 子节点中查找；
+        - 未找到则调用 deck 自带的 _ensure_virtual_holding_node()（新版 deck）；
+        - 老版序列化 deck 缺该方法时，构造一个等价的回退节点并挂到 deck 上。
+        """
+        deck = getattr(self, "deck", None)
+        if deck is None:
+            return None
+        node_name = self._virtual_holding_node_name()
+        for child in getattr(deck, "children", []) or []:
+            if getattr(child, "name", "") == node_name:
+                return child
+
+        deck_ensure = getattr(deck, "_ensure_virtual_holding_node", None)
+        if callable(deck_ensure):
+            try:
+                node = deck_ensure()
+                if node is not None:
+                    return node
+            except Exception as exc:
+                logger.warning(f"[虚拟暂存节点] deck._ensure_virtual_holding_node 失败，回退本地创建: {exc}")
+
+        # 回退：构造一个等价节点。
+        try:
+            from pylabrobot.resources import Coordinate
+            from ..resources.decks import (
+                BIOYOND_VIRTUAL_HOLDING_NODE_CATEGORY,
+                BIOYOND_VIRTUAL_HOLDING_NODE_MODEL,
+            )
+            category = BIOYOND_VIRTUAL_HOLDING_NODE_CATEGORY
+            model = BIOYOND_VIRTUAL_HOLDING_NODE_MODEL
+        except Exception:
+            from pylabrobot.resources import Coordinate
+            category = "virtual_holding"
+            model = "BioyondVirtualHolding"
+        try:
+            node = ResourcePLR(
+                name=node_name,
+                size_x=1.0,
+                size_y=1.0,
+                size_z=1.0,
+                category=category,
+                model=model,
+            )
+            deck.assign_child_resource(node, location=Coordinate(0.0, 0.0, 0.0))
+            logger.info(f"[虚拟暂存节点] 已在 deck 上回退创建虚拟暂存节点 {node_name}")
+            return node
+        except Exception as exc:
+            logger.error(f"[虚拟暂存节点] 回退创建失败: {exc}")
+            return None
+
+    def _park_resource(
+        self,
+        resource: ResourcePLR,
+        publish_roots: Optional[List[ResourcePLR]] = None,
+    ) -> bool:
+        """把 resource 从当前父节点卸下并挂到虚拟暂存节点下，保留最后库位元数据。
+
+        子树整体随父节点搬迁（offspring 仍然嵌套）。旧父节点追加进 publish_roots。
+        """
+        node = self._ensure_virtual_holding_node()
+        if node is None:
+            logger.warning(f"[暂存] 无虚拟暂存节点，无法 park {getattr(resource, 'name', None)}")
+            return False
+        if getattr(resource, "parent", None) is node:
+            return False
+        old_parent = getattr(resource, "parent", None)
+        if old_parent is not None:
+            self._unassign_resource_from_parent(resource)
+        try:
+            from pylabrobot.resources import Coordinate
+            node.assign_child_resource(resource, location=Coordinate(0.0, 0.0, 0.0))
+        except Exception:
+            try:
+                node.assign_child_resource(resource)
+            except Exception as exc:
+                logger.error(f"[暂存] 挂载 {getattr(resource, 'name', None)} 到虚拟暂存节点失败: {exc}")
+                return False
+        if publish_roots is not None:
+            publish_roots.append(old_parent if old_parent is not None else node)
+            publish_roots.append(node)
+        logger.info(
+            f"[暂存] 物料 {getattr(resource, 'name', None)} 已 park 到虚拟暂存节点 "
+            f"{getattr(node, 'name', None)}（保留最后库位元数据）"
+        )
+        return True
+
+    def _build_bioyond_lookup_map(self) -> Dict[str, ResourcePLR]:
+        """walk deck 一次，构造 {bioyond_id: resource} 瞬态映射（批次内复用）。
+
+        调用方在每次 create/move/park/delete 后用 _update_lookup_map 维护它。
+        """
+        lookup: Dict[str, ResourcePLR] = {}
+        deck = getattr(self, "deck", None)
+        if deck is None:
+            return lookup
+        for resource in self._iter_resource_subtree(deck):
+            if resource is deck:
+                continue
+            bid = self._resource_bioyond_id(resource)
+            if bid and bid not in lookup:
+                lookup[bid] = resource
+        return lookup
+
+    @staticmethod
+    def _update_lookup_map(
+        lookup: Optional[Dict[str, ResourcePLR]],
+        bioyond_id: Optional[str],
+        resource: Optional[ResourcePLR],
+    ) -> None:
+        """批次 lookup 维护：resource=None 表示删除该 id；否则写入/更新。"""
+        if lookup is None or not bioyond_id:
+            return
+        key = str(bioyond_id).strip()
+        if not key:
+            return
+        if resource is None:
+            lookup.pop(key, None)
+        else:
+            lookup[key] = resource
+
+    def _is_combined_counterpart(self, occupant: ResourcePLR, incoming_model: Optional[str]) -> bool:
+        """占位策略谓词：occupant 是否是合法的组合/底座-子物料配对方，应予保留。
+
+        泛化自 _preserve_slot_occupant_for_report：合成板/底座互为合法配对方。
+        """
+        if incoming_model == "bioyond_peptide_96_well_synthesis_plate" and self._is_synthesis_base(occupant):
+            return True
+        if incoming_model == "bioyond_peptide_96_well_synthesis_plate_base" and self._is_synthesis_plate(occupant):
+            return True
+        return False
+
+    def _resolve_target_slot_occupant(
+        self,
+        warehouse: ResourcePLR,
+        idx: int,
+        incoming_model: Optional[str],
+        incoming_resource: Optional[ResourcePLR] = None,
+        publish_roots: Optional[List[ResourcePLR]] = None,
+        on_conflict: str = "park",
+    ) -> str:
+        """共享占位策略：决定目标库位现有占位物的去留。
+
+        返回 "free"（本就空闲/即将入住物本身）、"preserve"（合法配对方，保留）、
+        "park"/"delete"（真冲突/陈旧重复，按 on_conflict 处理）。
+        """
+        try:
+            current = warehouse[idx]
+        except Exception:
+            current = None
+        if current is None or current is incoming_resource:
+            return "free"
+        if isinstance(current, (ResourceHolder, str)):
+            # ResourceHolder 是静态槽位结构，字符串是 stale occupied_by。
+            if isinstance(current, str):
+                sites = getattr(warehouse, "sites", None)
+                if isinstance(sites, list) and idx < len(sites):
+                    sites[idx] = None
+            return "free"
+        if self._is_combined_counterpart(current, incoming_model):
+            logger.debug(
+                f"[占位策略] 保留 {getattr(warehouse, 'name', None)}[{idx}] 的合法组合配对方 "
+                f"{getattr(current, 'name', None)}"
+            )
+            return "preserve"
+        # 真冲突 / 陈旧重复：按 on_conflict 处理。
+        if on_conflict == "delete":
+            self._remove_resource_subtree(current, publish_roots=publish_roots)
+            logger.warning(
+                f"[占位策略] 删除目标库位旧占位物: {getattr(warehouse, 'name', None)}[{idx}] "
+                f"-> {getattr(current, 'name', None)}"
+            )
+            return "delete"
+        self._park_resource(current, publish_roots=publish_roots)
+        logger.warning(
+            f"[占位策略] park 目标库位旧占位物: {getattr(warehouse, 'name', None)}[{idx}] "
+            f"-> {getattr(current, 'name', None)}"
+        )
+        return "park"
+
+    def _assign_child_to_parent_slot(self, parent: ResourcePLR, child: ResourcePLR) -> bool:
+        """把组合子物料挂到父物料的 0 号槽位（合成场景复用 _assign_plate_to_base_slot）。"""
+        if self._is_synthesis_base(parent):
+            return self._assign_plate_to_base_slot(parent, child)
+        if getattr(child, "parent", None) is parent:
+            return False
+        try:
+            current = parent[0] if hasattr(parent, "__getitem__") else None
+        except Exception:
+            current = None
+        if current is child:
+            return False
+        if isinstance(current, str):
+            sites = getattr(parent, "sites", None)
+            if isinstance(sites, list) and sites:
+                sites[0] = None
+        elif current is not None and current is not child:
+            self._unassign_resource_from_parent(current)
+        if getattr(child, "parent", None) is not None:
+            self._unassign_resource_from_parent(child)
+        try:
+            parent[0] = child
+        except Exception as exc:
+            logger.warning(
+                f"[组合物料] 挂载 {getattr(child, 'name', None)} 到父物料 "
+                f"{getattr(parent, 'name', None)} 槽位0失败: {exc}"
+            )
+            return False
+        logger.info(
+            f"[组合物料] {getattr(child, 'name', None)} 挂载到父物料 "
+            f"{getattr(parent, 'name', None)} 的槽位0"
+        )
+        return True
+
+    def _move_resource_to_warehouse_slot(
+        self,
+        resource: ResourcePLR,
+        warehouse: ResourcePLR,
+        idx: int,
+    ) -> bool:
+        """把已存在的 resource 搬到目标仓库槽位（先卸下当前父节点）。"""
+        try:
+            if warehouse[idx] is resource:
+                return True
+        except Exception:
+            pass
+        if getattr(resource, "parent", None) is not None:
+            self._unassign_resource_from_parent(resource)
+        try:
+            warehouse[idx] = resource
+        except Exception as exc:
+            logger.error(
+                f"[物料移动] 放置 {getattr(resource, 'name', None)} 到 "
+                f"{getattr(warehouse, 'name', None)}[{idx}] 失败: {exc}"
+            )
+            return False
+        return True
+
 
     def _clear_reported_location_occupants(
         self,
@@ -2590,123 +3021,254 @@ class BioyondWorkstation(WorkstationBase):
         logger.info(f"[物料变更报送] 已发布更新后的资源父节点: {reason}, roots={names}")
         return True
 
-    def process_material_change_report(self, report_data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理物料变更报送
+    def process_material_change_report(
+        self,
+        report_data: Dict[str, Any],
+        *,
+        on_empty_locations: str = "park",
+        source: str = "material_change",
+        source_scope: Optional[str] = None,
+        lookup: Optional[Dict[str, ResourcePLR]] = None,
+    ) -> Dict[str, Any]:
+        """统一的"移动优先" upsert 原语（所有同步路径共用）。
+
+        规范流程：(1) 按 source 权威 resolve/缓存 → (2) lookup 既有实例 →
+        (3) 更新 deck（move/create/park/delete）→ (4) publish。
 
         Args:
-            report_data: 物料变更数据
+            report_data: Bioyond 物料载荷（首个位置参数，HTTP 委托以单参调用，
+                因此其余参数全部 keyword-only 带默认值，保持向后兼容）。
+            on_empty_locations: 空 locations 且无 combinedMaterialId 时的策略：
+                "park"（默认，挂虚拟暂存节点）或 "delete"（硬删子树）。
+            source: 来源枚举（material_change/stock_material/order_materials/material_info）。
+            source_scope: 来源作用域（如 order sync 的 order_id）。
+            lookup: 批次瞬态 {bioyond_id: resource} 映射；提供时用它查找并在
+                create/move/park/delete 后维护，缺省时回退 deck walk。
 
         Returns:
-            Dict[str, Any]: 处理结果
+            Dict，至少含 success/action/message。action ∈
+            {"delete","park","move","add","noop"}；API 失败时 success=False。
         """
         try:
+            # ---------- (1) resolve/cache by source authority ----------
             synchronizer = getattr(self, "resource_synchronizer", None)
-            if synchronizer is not None and hasattr(synchronizer, "_resolve_material_payloads"):
-                resolved_payloads = synchronizer._resolve_material_payloads(
-                    [report_data],
-                    source="material_change",
-                )
-                if resolved_payloads:
-                    report_data = resolved_payloads[0]
-            material_id = (
-                report_data.get("id")
-                or report_data.get("materialId")
-                or report_data.get("material_id")
-                or report_data.get("bioyond_id")
+            norm_source = (
+                synchronizer._normalize_source(source)
+                if synchronizer is not None and hasattr(synchronizer, "_normalize_source")
+                else source
             )
+
+            # 归一化别名（materialId→id 等），不丢弃原始 key、不臆造 locations。
+            if synchronizer is not None and hasattr(synchronizer, "normalize_material_aliases"):
+                report_data = synchronizer.normalize_material_aliases(report_data)
+            else:
+                report_data = dict(report_data)
+
+            material_id = synchronizer._material_bioyond_id(report_data) if synchronizer else (
+                report_data.get("id") or report_data.get("materialId") or report_data.get("material_id")
+            )
+            material_id = str(material_id or "").strip()
             if material_id and not report_data.get("id"):
                 report_data = dict(report_data)
-                report_data["id"] = str(material_id).strip()
+                report_data["id"] = material_id
+
+            # 稀疏载荷（尤其实时推送）回退 material-info(id)，取权威完整状态（含 locations）。
+            need_info = (
+                norm_source == "material_change"
+                and "locations" not in report_data
+                and material_id
+            )
+            if need_info and synchronizer is not None and hasattr(synchronizer, "material_info_result"):
+                info_result = synchronizer.material_info_result(material_id)
+                if not info_result.get("ok"):
+                    msg = info_result.get("message") or "material-info 查询失败"
+                    logger.error(f"[物料变更报送] material-info 失败，跳过 deck 变更: id={material_id} {msg}")
+                    return {
+                        "processed": False,
+                        "success": False,
+                        "action": "noop",
+                        "material_id": material_id,
+                        "message": msg,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                info = info_result.get("data") or {}
+                if info:
+                    merged = dict(report_data)
+                    merged.update(info)
+                    merged["id"] = material_id
+                    report_data = merged
+
+            # 兜底走旧的 payload 解析（补类型/编码元数据，不复用旧库位）。
+            if synchronizer is not None and hasattr(synchronizer, "_resolve_material_payloads"):
+                resolved = synchronizer._resolve_material_payloads([report_data], source=norm_source)
+                if resolved:
+                    report_data = resolved[0]
+
             material_name = report_data.get("name")
             material_type = report_data.get("typeName")
             locations = report_data.get("locations") or []
+            combined_parent_id = str(report_data.get("combinedMaterialId") or "").strip()
             logger.info(
                 f"[物料变更报送] 物料: id={material_id} name={material_name} "
-                f"type={material_type} locations={len(locations)}"
+                f"type={material_type} locations={len(locations)} source={norm_source}"
             )
 
-            existing_resource = self._find_material_resource(report_data)
-            removed_count = 0
-            publish_roots: List[ResourcePLR] = []
-            if existing_resource is not None:
-                removed_count = self._remove_resource_subtree(existing_resource, publish_roots=publish_roots)
-                logger.info(
-                    f"[物料变更报送] 移除旧物料实例: {existing_resource.name} "
-                    f"(removed={removed_count})"
-                )
-            cleared_stale = self._clear_stale_occupied_by_strings(report_data)
-
+            # 源感知缓存更新（API 失败已在上面短路，不会到这里改缓存/deck）。
             material_cache_updated = False
             try:
                 if synchronizer is not None and hasattr(synchronizer, "_update_material_cache_from_stock"):
-                    synchronizer._update_material_cache_from_stock([report_data], source="material_change")
+                    synchronizer._update_material_cache_from_stock(
+                        [report_data], source=norm_source, source_scope=source_scope
+                    )
                     material_cache_updated = True
             except Exception as exc:
                 logger.warning(f"[物料变更报送] 更新物料缓存失败: {exc}")
 
-            combined_parent_id = str(report_data.get("combinedMaterialId") or "").strip()
+            # ---------- (2) lookup existing instance ----------
+            if lookup is not None and material_id:
+                existing_resource = lookup.get(material_id)
+            else:
+                existing_resource = self._find_material_resource_by_bioyond_id(material_id) if material_id else None
+                if existing_resource is None:
+                    existing_resource = self._find_material_resource(report_data)
+
+            cleared_stale = self._clear_stale_occupied_by_strings(report_data)
+            publish_roots: List[ResourcePLR] = []
+
+            # ---------- (3) update deck ----------
+            # (3a) 空 locations + 无 combinedMaterialId → park 或 delete
             if not locations and not combined_parent_id:
+                action = "noop"
+                if existing_resource is not None:
+                    if on_empty_locations == "delete":
+                        self._remove_resource_subtree(existing_resource, publish_roots=publish_roots)
+                        action = "delete"
+                    else:
+                        # park 前先刷新最后库位元数据再搬迁。
+                        self._annotate_reported_material(existing_resource, report_data)
+                        self._park_resource(existing_resource, publish_roots=publish_roots)
+                        action = "park"
+                    self._update_lookup_map(
+                        lookup, material_id, None if action == "delete" else existing_resource
+                    )
                 published = self._publish_material_tree_update(
-                    f"delete:{material_id or material_name}",
+                    f"{action}:{material_id or material_name}",
                     resources=publish_roots,
                 )
                 return {
                     "processed": True,
-                    "action": "delete",
+                    "success": True,
+                    "action": action,
                     "material_id": material_id,
                     "material_name": material_name,
-                    "removed_count": removed_count,
                     "cleared_stale_slots": cleared_stale,
                     "material_cache_updated": material_cache_updated,
                     "published": published,
-                    "timestamp": datetime.now().isoformat()
+                    "message": f"{action} 完成",
+                    "timestamp": datetime.now().isoformat(),
                 }
 
-            cleared_occupied = self._clear_reported_location_occupants(report_data, publish_roots=publish_roots)
+            # (3b) 有归宿：先尝试组合父挂载，否则按 locations[] 计算仓库槽位。
+            incoming_model = self._reported_material_model(report_data)
+            cleared_occupied = 0
+            action = None
 
-            placed_resources = resource_bioyond_to_plr(
-                [report_data],
-                type_mapping=self.bioyond_config["material_type_mappings"],
-                deck=self.deck,
-            )
-            for resource in placed_resources:
-                self._annotate_reported_material(resource, report_data)
-                self._append_material_publish_root(publish_roots, resource)
+            # combined：父无差异位置 → 挂父槽位0
+            parent_resource = None
+            if combined_parent_id:
+                if lookup is not None:
+                    parent_resource = lookup.get(combined_parent_id)
+                if parent_resource is None:
+                    parent_resource = self._find_material_resource_by_bioyond_id(combined_parent_id)
+
+            target_warehouse = None
+            target_idx = None
+            mount_to_parent = False
+            if parent_resource is not None:
+                child_location_key = self._first_location_key_from_material_data(report_data)
+                parent_location_key = self._first_location_key_from_resource(parent_resource)
+                if child_location_key is None or child_location_key == parent_location_key:
+                    mount_to_parent = True
+            if not mount_to_parent and locations:
+                target_warehouse, target_idx, _slot_key = self._bioyond_slot_from_location(locations[0])
+
+            if existing_resource is not None:
+                # ---- MOVE 既有实例（保持对象身份/内容）----
+                if mount_to_parent and parent_resource is not None:
+                    self._append_material_publish_root(publish_roots, existing_resource)
+                    self._assign_child_to_parent_slot(parent_resource, existing_resource)
+                    self._append_material_publish_root(publish_roots, parent_resource)
+                    action = "move"
+                elif target_warehouse is not None and target_idx is not None:
+                    self._resolve_target_slot_occupant(
+                        target_warehouse, target_idx, incoming_model,
+                        incoming_resource=existing_resource,
+                        publish_roots=publish_roots, on_conflict="park",
+                    )
+                    self._append_material_publish_root(publish_roots, existing_resource)
+                    self._move_resource_to_warehouse_slot(existing_resource, target_warehouse, target_idx)
+                    publish_roots.append(target_warehouse)
+                    action = "move"
+                else:
+                    # 无法解析目标库位：保留实例，仅刷新元数据。
+                    action = "noop"
+                self._annotate_reported_material(existing_resource, report_data)
+                self._update_lookup_map(lookup, material_id, existing_resource)
+                placed_resources = [existing_resource]
+            else:
+                # ---- CREATE：deck 上没有该实例，走 graphio 转换 ----
+                cleared_occupied = self._clear_reported_location_occupants(
+                    report_data, publish_roots=publish_roots
+                )
+                lookup_fn = lookup if lookup is not None else self._find_material_resource_by_bioyond_id
+                placed_resources = resource_bioyond_to_plr(
+                    [report_data],
+                    type_mapping=self.bioyond_config["material_type_mappings"],
+                    deck=self.deck,
+                    lookup=lookup_fn,
+                )
+                for resource in placed_resources:
+                    self._annotate_reported_material(resource, report_data)
+                    self._append_material_publish_root(publish_roots, resource)
+                    rid = self._resource_bioyond_id(resource)
+                    self._update_lookup_map(lookup, rid, resource)
+                action = "add"
 
             reconciled = self._reconcile_synthesis_plate_bases(placed_resources)
             if reconciled:
                 for resource in placed_resources:
                     self._append_material_publish_root(publish_roots, resource)
+
             published = self._publish_material_tree_update(
-                f"upsert:{material_id or material_name}",
+                f"{action}:{material_id or material_name}",
                 resources=publish_roots,
             )
-            action = "move" if removed_count else "add"
             logger.info(
                 f"[物料变更报送] {action} 完成: id={material_id} name={material_name} "
                 f"resources={len(placed_resources)} reconciled={reconciled} published={published}"
             )
-
             return {
                 "processed": True,
+                "success": True,
                 "action": action,
                 "material_id": material_id,
                 "material_name": material_name,
                 "material_type": material_type,
                 "locations_count": len(locations),
                 "resources_count": len(placed_resources),
-                "removed_count": removed_count,
                 "cleared_stale_slots": cleared_stale,
                 "cleared_occupied_slots": cleared_occupied,
                 "material_cache_updated": material_cache_updated,
                 "base_plate_reconciled": reconciled,
                 "published": published,
-                "timestamp": datetime.now().isoformat()
+                "message": f"{action} 完成",
+                "timestamp": datetime.now().isoformat(),
             }
 
         except Exception as e:
             logger.error(f"处理物料变更报送失败: {e}")
-            return {"processed": False, "error": str(e)}
+            logger.debug(traceback.format_exc())
+            return {"processed": False, "success": False, "action": "error", "error": str(e), "message": str(e)}
 
 
     def handle_external_error(self, error_data: Dict[str, Any]) -> Dict[str, Any]:

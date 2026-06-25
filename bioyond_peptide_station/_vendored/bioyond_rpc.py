@@ -247,6 +247,90 @@ class BioyondV1RPC(BaseRequest):
             return []
         return response.get("data") or []
 
+    # ---- result-aware (non-collapsing) variants ------------------------------
+    # 这些 *_result 方法不会把"调用失败"和"真·空结果"折叠成同一个空集合：
+    # 它们返回 {"ok": bool, "data": <list|dict>, "message": str, "code": int|None}，
+    # 让上层（核心同步逻辑）能区分 API 失败 与 code==1 的空成功。原有方法保持不变。
+
+    def _post_result(self, url: str, data: Any, *, data_kind: str) -> dict:
+        """执行一次 LIMS POST 并解析为非折叠结果。
+
+        data_kind 取 "list" 或 "dict"，决定成功/失败时 data 的空集合类型。
+        返回 {"ok", "data", "message", "code"}：
+          - ok=True 仅当 HTTP 成功且解析出 code == 1；此时 data 为 response["data"]
+            （为 null 时按 data_kind 归一化为 [] / {}），message 取 LIMS message，code 为 int。
+          - ok=False 表示任何失败（传输异常、非 JSON/结构异常、code != 1）；此时 data 为
+            对应类型的空集合，message 取 LIMS message（无则异常文本），code 为 int 或 None。
+        """
+        empty: Any = [] if data_kind == "list" else {}
+        try:
+            response = self.post(
+                url=url,
+                params={
+                    "apiKey": self.api_key,
+                    "requestTime": self.get_current_time_iso8601(),
+                    "data": data,
+                })
+        except Exception as exc:  # post 通常自吞异常返回 {}，此处兜底传输层异常
+            return {"ok": False, "data": empty, "message": str(exc), "code": None}
+
+        if not isinstance(response, dict) or not response:
+            return {"ok": False, "data": empty,
+                    "message": "请求失败或返回为空", "code": None}
+
+        raw_code = response.get("code")
+        try:
+            code: Optional[int] = int(raw_code) if raw_code is not None else None
+        except (TypeError, ValueError):
+            code = None
+        message = str(response.get("message", "") or "")
+
+        if code != 1:
+            return {"ok": False, "data": empty,
+                    "message": message or f"LIMS 返回 code={raw_code}", "code": code}
+
+        payload = response.get("data")
+        if payload is None:
+            payload = empty
+        return {"ok": True, "data": payload, "message": message, "code": code}
+
+    def stock_material_result(self, json_str: str) -> dict:
+        """stock_material 的非折叠版本。见 _post_result 文档。"""
+        try:
+            params = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            return {"ok": False, "data": [],
+                    "message": f"json_str 无法解析: {exc}", "code": None}
+        return self._post_result(
+            url=f'{self.host}/api/lims/storage/stock-material',
+            data=params,
+            data_kind="list",
+        )
+
+    def materials_by_order_id_result(self, json_str: str) -> dict:
+        """materials_by_order_id 的非折叠版本。见 _post_result 文档。"""
+        try:
+            params = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            return {"ok": False, "data": [],
+                    "message": f"json_str 无法解析: {exc}", "code": None}
+        if not isinstance(params, dict) or not params.get("orderId"):
+            return {"ok": False, "data": [],
+                    "message": "缺少 orderId", "code": None}
+        return self._post_result(
+            url=f'{self.host}/api/lims/order/materials-by-order-id',
+            data=str(params["orderId"]),
+            data_kind="list",
+        )
+
+    def material_info_result(self, material_id: str) -> dict:
+        """material_info 的非折叠版本。见 _post_result 文档。"""
+        return self._post_result(
+            url=f'{self.host}/api/lims/storage/material-info',
+            data=material_id,
+            data_kind="dict",
+        )
+
     def query_warehouse_by_material_type(self, type_id: str) -> dict:
         """
             描述：查询物料类型可以入库的库位

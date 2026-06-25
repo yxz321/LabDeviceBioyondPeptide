@@ -434,6 +434,7 @@ class _FakeRPCForWait:
     ) -> None:
         self.order_report_calls: List[str] = []
         self.materials_by_order_id_calls: List[str] = []
+        self.materials_by_order_id_result_calls: List[str] = []
         self._order_report_response = order_report_response or {}
         self._all_stock_response = list(all_stock_response or [])
 
@@ -444,6 +445,11 @@ class _FakeRPCForWait:
     def materials_by_order_id(self, json_str: str) -> List[Dict[str, Any]]:
         self.materials_by_order_id_calls.append(json_str)
         return list(self._all_stock_response)
+
+    def materials_by_order_id_result(self, json_str: str) -> Dict[str, Any]:
+        # 同步路径已切到 result-aware 取数（非折叠 dict 形状）。
+        self.materials_by_order_id_result_calls.append(json_str)
+        return {"ok": True, "data": list(self._all_stock_response), "message": "", "code": 1}
 
 
 def test_wait_for_order_finish_returns_timeout_when_event_never_fires() -> None:
@@ -463,7 +469,7 @@ def test_wait_for_order_finish_returns_timeout_when_event_never_fires() -> None:
     assert result["order_code"] == "EXP-001"
     assert result["materials_by_order_id"] == []
     assert result["resultTable"]["data"] == []
-    assert station.hardware_interface.materials_by_order_id_calls == []
+    assert station.hardware_interface.materials_by_order_id_result_calls == []
 
 
 def test_wait_for_order_finish_uses_order_id_when_calling_materials_by_order_id() -> None:
@@ -494,8 +500,8 @@ def test_wait_for_order_finish_uses_order_id_when_calling_materials_by_order_id(
 
     assert result["order_finish_status"] == "success"
     assert result["success"] is True
-    assert len(rpc.materials_by_order_id_calls) == 1
-    payload = json.loads(rpc.materials_by_order_id_calls[0])
+    assert len(rpc.materials_by_order_id_result_calls) == 1
+    payload = json.loads(rpc.materials_by_order_id_result_calls[0])
     assert payload == {"orderId": "OID-1"}, "materials_by_order_id 必须接收 orderId 作为输入"
     assert result["resultTable"]["columns"][0] == {"name": "设备", "key": "whName"}
     assert result["resultTable"]["data"] == [

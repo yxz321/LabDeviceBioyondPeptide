@@ -1,10 +1,17 @@
-from pylabrobot.resources import Deck, Coordinate
+from pylabrobot.resources import Deck, Coordinate, Resource
 
 from unilabos.registry.decorators import resource
 from bioyond_peptide_station.resources.warehouses import (
     bioyond_warehouse_numeric_stack,  # 多肽站自动化堆栈
     bioyond_warehouse_live_grid,
 )
+
+
+# 虚拟暂存节点（limbo）：parked/limbo 物料的统一持有节点。
+# 通过精确身份（名称/类别）识别，stale/delete 清扫与仓库/Bioyond 导出逻辑据此排除它。
+BIOYOND_VIRTUAL_HOLDING_NODE_NAME = "BioyondVirtualHolding"
+BIOYOND_VIRTUAL_HOLDING_NODE_MODEL = "BioyondVirtualHolding"
+BIOYOND_VIRTUAL_HOLDING_NODE_CATEGORY = "virtual_holding"
 
 
 @resource(
@@ -56,17 +63,43 @@ class BIOYOND_PeptideStation_Deck(Deck):
         else:
             result = super(BIOYOND_PeptideStation_Deck, cls).deserialize(data, allow_marshal=allow_marshal)
         result._ensure_peptide_warehouse_metadata()
+        result._ensure_virtual_holding_node()
         return result
 
     def _ensure_peptide_warehouse_metadata(self) -> None:
         for child in getattr(self, "children", []):
             name = getattr(child, "name", "")
+            if name == BIOYOND_VIRTUAL_HOLDING_NODE_NAME:
+                # 虚拟暂存节点不是仓库，跳过 axis 元数据标注。
+                continue
             axis = self.WAREHOUSE_BIOYOND_AXIS.get(name)
             if axis and not hasattr(child, "bioyond_axis"):
                 child.bioyond_axis = axis
             key_axis = self.WAREHOUSE_BIOYOND_KEY_AXIS.get(name)
             if key_axis and not hasattr(child, "bioyond_key_axis"):
                 child.bioyond_key_axis = key_axis
+
+    def _ensure_virtual_holding_node(self) -> Resource:
+        """确保 deck 上存在唯一的虚拟暂存节点（limbo），用于持有 parked/limbo 物料。
+
+        通过精确名称识别，幂等：已存在则直接返回。该节点不会被加入
+        self.warehouses / self.warehouse_locations，也不会被仓库迭代/元数据逻辑当作仓库。
+        """
+        for child in getattr(self, "children", []):
+            if getattr(child, "name", "") == BIOYOND_VIRTUAL_HOLDING_NODE_NAME:
+                return child
+
+        node = Resource(
+            name=BIOYOND_VIRTUAL_HOLDING_NODE_NAME,
+            size_x=1.0,
+            size_y=1.0,
+            size_z=1.0,
+            category=BIOYOND_VIRTUAL_HOLDING_NODE_CATEGORY,
+            model=BIOYOND_VIRTUAL_HOLDING_NODE_MODEL,
+        )
+        # 放在不与任何仓库碰撞的角落坐标。
+        self.assign_child_resource(node, location=Coordinate(0.0, 0.0, 0.0))
+        return node
 
     def _frontend_y_flipped_coordinate(self, display_x: float, display_y: float, child) -> Coordinate:
         """把期望显示坐标转换为兼容前端 y 轴翻转的存储坐标。"""
@@ -206,3 +239,6 @@ class BIOYOND_PeptideStation_Deck(Deck):
 
         for warehouse_name, warehouse in self.warehouses.items():
             self.assign_child_resource(warehouse, location=self.warehouse_locations[warehouse_name])
+
+        # 仓库分配完成后，挂载唯一的虚拟暂存节点（limbo）。
+        self._ensure_virtual_holding_node()
