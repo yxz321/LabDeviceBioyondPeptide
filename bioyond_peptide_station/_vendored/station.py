@@ -2134,17 +2134,29 @@ class BioyondWorkstation(WorkstationBase):
             yield from self._iter_resource_subtree(child)
 
     @staticmethod
-    def _dedupe_material_publish_roots(resources: Optional[List[ResourcePLR]]) -> List[ResourcePLR]:
+    def _material_publish_root(resource: Optional[ResourcePLR]) -> Optional[ResourcePLR]:
+        if resource is None:
+            return None
+        root = resource
+        parent = getattr(root, "parent", None)
+        while parent is not None and getattr(parent, "parent", None) is not None:
+            root = parent
+            parent = getattr(root, "parent", None)
+        return root
+
+    @classmethod
+    def _dedupe_material_publish_roots(cls, resources: Optional[List[ResourcePLR]]) -> List[ResourcePLR]:
         deduped: List[ResourcePLR] = []
         seen: set[int] = set()
         for resource in resources or []:
-            if resource is None:
+            root = cls._material_publish_root(resource)
+            if root is None:
                 continue
-            marker = id(resource)
+            marker = id(root)
             if marker in seen:
                 continue
             seen.add(marker)
-            deduped.append(resource)
+            deduped.append(root)
         return deduped
 
     def _append_material_publish_root(
@@ -2154,8 +2166,9 @@ class BioyondWorkstation(WorkstationBase):
     ) -> None:
         if publish_roots is None or resource is None:
             return
-        parent = getattr(resource, "parent", None)
-        publish_roots.append(parent if parent is not None else resource)
+        root = self._material_publish_root(resource)
+        if root is not None:
+            publish_roots.append(root)
 
     @staticmethod
     def _clean_bioyond_identity(value: Any) -> Optional[str]:

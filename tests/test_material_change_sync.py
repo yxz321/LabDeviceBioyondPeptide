@@ -565,6 +565,9 @@ def test_synthesis_plate_attaches_to_base_when_reported_at_same_location(
     assert base[0] is plate
     assert getattr(plate, "parent", None) is base
     assert plate in base.children
+    assert station._ros_node.update_resource_calls[-1]["resources"] == [
+        station.deck.warehouses[BASE_WAREHOUSE]
+    ]
     _assert_published_deck(station, expected_count=2)
 
 
