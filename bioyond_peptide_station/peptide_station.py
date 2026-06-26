@@ -2707,9 +2707,9 @@ class BioyondPeptideStation(BioyondWorkstation):
         return sorted(
             rows,
             key=lambda row: (
-                text_key(row.get("materialName")),
                 text_key(row.get("whName")),
                 location_key(row.get("locationCode")),
+                text_key(row.get("materialName")),
             ),
         )
 
