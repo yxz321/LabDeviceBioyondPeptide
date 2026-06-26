@@ -409,15 +409,25 @@ def test_build_unload_table_uses_four_columns_in_name_key_format() -> None:
     ]
 
 
-def test_build_unload_table_sorts_rows_by_material_warehouse_and_location() -> None:
+def test_build_unload_table_sorts_rows_by_warehouse_location_then_material() -> None:
     cls = getattr(_import_module(), CLASS_NAME)
     table = cls._build_unload_table([
-        {"whName": "WH", "locationCode": "10-2", "materialName": "样品", "quantity": "1"},
-        {"whName": "WH", "locationCode": "2-02", "materialName": "样品", "quantity": "1"},
-        {"whName": "WH", "locationCode": "2-01", "materialName": "样品", "quantity": "1"},
-        {"whName": "WH", "locationCode": "1-01", "materialName": "", "quantity": "1"},
+        {"whName": "WH-B", "locationCode": "1-01", "materialName": "WH-B 样品", "quantity": "1"},
+        {"whName": "WH-A", "locationCode": "10-2", "materialName": "样品C", "quantity": "1"},
+        {"whName": "WH-A", "locationCode": "2-02", "materialName": "样品B", "quantity": "1"},
+        {"whName": "WH-A", "locationCode": "2-01", "materialName": "", "quantity": "1"},
+        {"whName": "WH-A", "locationCode": "2-01", "materialName": "样品A", "quantity": "1"},
     ])
-    assert [row["locationCode"] for row in table["data"]] == ["2-01", "2-02", "10-2", "1-01"]
+    assert [
+        (row["whName"], row["locationCode"], row["materialName"])
+        for row in table["data"]
+    ] == [
+        ("WH-A", "2-01", "样品A"),
+        ("WH-A", "2-01", ""),
+        ("WH-A", "2-02", "样品B"),
+        ("WH-A", "10-2", "样品C"),
+        ("WH-B", "1-01", "WH-B 样品"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -558,9 +568,11 @@ def test_wait_for_order_finish_returns_sorted_unload_result_table() -> None:
     station = _fresh_station()
     rpc = _FakeRPCForWait(
         all_stock_response=[
-            {"id": "m3", "name": "样品", "quantity": 1, "locations": [{"code": "10-2", "whName": "WH"}]},
-            {"id": "m2", "name": "样品", "quantity": 1, "locations": [{"code": "2-02", "whName": "WH"}]},
-            {"id": "m1", "name": "样品", "quantity": 1, "locations": [{"code": "2-01", "whName": "WH"}]},
+            {"id": "m5", "name": "WH-B 样品", "quantity": 1, "locations": [{"code": "1-01", "whName": "WH-B"}]},
+            {"id": "m4", "name": "样品C", "quantity": 1, "locations": [{"code": "10-2", "whName": "WH-A"}]},
+            {"id": "m3", "name": "样品B", "quantity": 1, "locations": [{"code": "2-02", "whName": "WH-A"}]},
+            {"id": "m2", "name": "", "quantity": 1, "locations": [{"code": "2-01", "whName": "WH-A"}]},
+            {"id": "m1", "name": "样品A", "quantity": 1, "locations": [{"code": "2-01", "whName": "WH-A"}]},
         ],
     )
     station.hardware_interface = rpc
@@ -580,7 +592,16 @@ def test_wait_for_order_finish_returns_sorted_unload_result_table() -> None:
         poll_interval_seconds=0.01,
     )
 
-    assert [row["locationCode"] for row in result["resultTable"]["data"]] == ["2-01", "2-02", "10-2"]
+    assert [
+        (row["whName"], row["locationCode"], row["materialName"])
+        for row in result["resultTable"]["data"]
+    ] == [
+        ("WH-A", "2-01", "样品A"),
+        ("WH-A", "2-01", ""),
+        ("WH-A", "2-02", "样品B"),
+        ("WH-A", "10-2", "样品C"),
+        ("WH-B", "1-01", "WH-B 样品"),
+    ]
 
 
 @pytest.mark.parametrize("raw_status,expected_status,expected_success", [
@@ -786,7 +807,8 @@ def test_unload_materials_is_ast_visible_as_manual_confirm() -> None:
 
     meta = actions["unload_materials"]
     args = meta["action_args"]
-    assert args["node_type"] == "MANUAL_CONFIRM"
+    node_type = args["node_type"]
+    assert node_type == "MANUAL_CONFIRM" or node_type.endswith(":NodeType.MANUAL_CONFIRM")
     assert args["always_free"] is True
     assert args["placeholder_keys"]["resultTable"] == "unilabos_manual_confirm"
     assert args["placeholder_keys"]["assignee_user_ids"] == "unilabos_manual_confirm"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import json
@@ -20,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 MODULE_PATH = "bioyond_peptide_station.peptide_station"
 CLASS_NAME = "BioyondPeptideStation"
+PEPTIDE_STATION_PATH = REPO_ROOT / "bioyond_peptide_station" / "peptide_station.py"
 
 ORDER_GUID = "3a20eabe-bad5-ef95-49bd-7ffbd5df189d"
 CREATE_ALLOCATION = {
@@ -179,9 +181,120 @@ def _action_handle_keys(meta: Dict[str, Any]) -> List[Any]:
     return [_action_handle_key(handle) for handle in _action_handle_items(meta)]
 
 
+def _station_ast() -> ast.Module:
+    return ast.parse(PEPTIDE_STATION_PATH.read_text(encoding="utf-8"))
+
+
+def _ast_class(name: str) -> ast.ClassDef:
+    for node in _station_ast().body:
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return node
+    raise AssertionError(f"missing class {name}")
+
+
+def _station_method_ast(name: str) -> ast.FunctionDef:
+    cls = _ast_class(CLASS_NAME)
+    for node in cls.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"missing method {name}")
+
+
+def _action_decorator_ast(method_name: str) -> ast.Call:
+    method = _station_method_ast(method_name)
+    for decorator in method.decorator_list:
+        if isinstance(decorator, ast.Call):
+            func = decorator.func
+            if isinstance(func, ast.Name) and func.id == "action":
+                return decorator
+    raise AssertionError(f"missing @action for {method_name}")
+
+
+def _action_handle_labels(method_name: str) -> Dict[str, str]:
+    decorator = _action_decorator_ast(method_name)
+    handles_kw = next((kw for kw in decorator.keywords if kw.arg == "handles"), None)
+    if handles_kw is None or not isinstance(handles_kw.value, ast.List):
+        return {}
+    labels: Dict[str, str] = {}
+    for item in handles_kw.value.elts:
+        if not isinstance(item, ast.Call):
+            continue
+        values = {
+            kw.arg: ast.literal_eval(kw.value)
+            for kw in item.keywords
+            if kw.arg in {"key", "label"} and isinstance(kw.value, ast.Constant)
+        }
+        if "key" in values and "label" in values:
+            labels[str(values["key"])] = str(values["label"])
+    return labels
+
+
+def _typed_dict_field_metadata(class_name: str, field_name: str) -> Dict[str, str]:
+    cls = _ast_class(class_name)
+    field = next(
+        (node for node in cls.body if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == field_name),
+        None,
+    )
+    assert field is not None, f"missing {class_name}.{field_name}"
+    field_call = next(
+        (node for node in ast.walk(field.annotation) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Field"),
+        None,
+    )
+    assert field_call is not None, f"missing Field metadata for {class_name}.{field_name}"
+    return {
+        kw.arg: ast.literal_eval(kw.value)
+        for kw in field_call.keywords
+        if kw.arg in {"title", "description"} and isinstance(kw.value, ast.Constant)
+    }
+
+
 def _import_bioyond_rpc_module() -> Any:
     pytest.importorskip("rclpy.logging", reason="Bioyond RPC 依赖 UniLab/ROS 运行环境")
     return importlib.import_module("bioyond_peptide_station._vendored.bioyond_rpc")
+
+
+def test_registry_surface_labels_follow_action_args_contract_ast() -> None:
+    source = PEPTIDE_STATION_PATH.read_text(encoding="utf-8")
+    assert '"reset_order_status": "实验状态复位"' in source
+    assert "实验ID" not in source
+    assert "订单ID" not in source
+    assert "订单状态复位" not in source
+
+    assert _action_handle_labels("sync_materials_from_bioyond_by_order_id")["order_id"] == "<order_id>"
+    assert _action_handle_labels("wait_for_order_finish")["order_code"] == "实验编号"
+    assert _action_handle_labels("wait_for_order_finish")["order_id"] == "<order_id>"
+    assert _action_handle_labels("wait_for_order_finish")["order_ids"] == "<order_ids>"
+    assert _action_handle_labels("batch_cancel_experiment")["order_codes"] == "实验编号列表*"
+
+    start_doc = ast.get_docstring(_station_method_ast("start_experiment")) or ""
+    assert "materials_loaded[物料已装载*]" in start_doc
+    assert "order_id[<order_id>*]" in start_doc
+    assert "resultTable[<resultTable>]" in start_doc
+
+    unload_doc = ast.get_docstring(_station_method_ast("unload_materials")) or ""
+    assert "materials_unloaded[物料已下料*]" in unload_doc
+    assert "order_id[<order_id>*]" in unload_doc
+    assert "resultTable[<resultTable>]" in unload_doc
+
+
+def test_submit_param_field_metadata_uses_titles_and_user_facing_descriptions_ast() -> None:
+    sample_meta = _typed_dict_field_metadata("PeptideDay2RequiredParams", "sample_excel_pattern")
+    assert sample_meta == {
+        "title": "样品excel名称*",
+        "description": "选择要提交的excel文件；如果已传入<sample_excel_pattern>，可填写空字符串。",
+    }
+
+    order_name_meta = _typed_dict_field_metadata("PeptideCommonSubmitOptionalParams", "order_name")
+    assert order_name_meta == {
+        "title": "实验名称",
+        "description": "给本次实验显示的名称；未填写时由系统生成。",
+    }
+
+    auto_sync_meta = _typed_dict_field_metadata("PeptideCommonSubmitOptionalParams", "auto_register_materials")
+    assert auto_sync_meta == {
+        "title": "创建后同步物料",
+        "description": "创建实验后同步本次实验用到的物料到本地资源树。",
+    }
 
 
 def test_build_scheduler_error_handling_reply_data_accepts_advertised_options() -> None:
@@ -848,17 +961,37 @@ def test_build_result_table_order_and_columns() -> None:
     assert table["data"][1]["locationCode"] == "A1-show"
 
 
-def test_build_result_table_sorts_blank_last_and_location_naturally() -> None:
+def test_build_result_table_sorts_by_warehouse_location_then_material() -> None:
     station = _make_station()
+    station.hardware_interface.material_info.side_effect = lambda material_id: {
+        "locations": [
+            {
+                "whName": {
+                    "mat-a": "WH-A",
+                    "mat-b": "WH-B",
+                }.get(material_id, "")
+            }
+        ]
+    }
     table = station._build_result_table({
         "Sample": [
-            {"materialName": "样品", "materialId": "mat-1", "quantity": "1", "locationCode": "10-2"},
-            {"materialName": "样品", "materialId": "mat-1", "quantity": "1", "locationCode": "2-02"},
-            {"materialName": "", "materialId": "mat-1", "quantity": "1", "locationCode": "1-01"},
-            {"materialName": "样品", "materialId": "mat-1", "quantity": "1", "locationCode": "2-01"},
+            {"materialName": "WH-B 样品", "materialId": "mat-b", "quantity": "1", "locationCode": "1-01"},
+            {"materialName": "样品C", "materialId": "mat-a", "quantity": "1", "locationCode": "10-2"},
+            {"materialName": "样品B", "materialId": "mat-a", "quantity": "1", "locationCode": "2-02"},
+            {"materialName": "", "materialId": "mat-a", "quantity": "1", "locationCode": "2-01"},
+            {"materialName": "样品A", "materialId": "mat-a", "quantity": "1", "locationCode": "2-01"},
         ]
     })
-    assert [row["locationCode"] for row in table["data"]] == ["2-01", "2-02", "10-2", "1-01"]
+    assert [
+        (row["whName"], row["locationCode"], row["materialName"])
+        for row in table["data"]
+    ] == [
+        ("WH-A", "2-01", "样品A"),
+        ("WH-A", "2-01", ""),
+        ("WH-A", "2-02", "样品B"),
+        ("WH-A", "10-2", "样品C"),
+        ("WH-B", "1-01", "WH-B 样品"),
+    ]
 
 
 def test_build_result_table_empty_returns_empty_data() -> None:
