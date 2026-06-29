@@ -229,6 +229,40 @@ def _action_handle_labels(method_name: str) -> Dict[str, str]:
     return labels
 
 
+def _action_input_handle_keys(method_name: str) -> List[str]:
+    decorator = _action_decorator_ast(method_name)
+    handles_kw = next((kw for kw in decorator.keywords if kw.arg == "handles"), None)
+    if handles_kw is None or not isinstance(handles_kw.value, ast.List):
+        return []
+    keys: List[str] = []
+    for item in handles_kw.value.elts:
+        if not isinstance(item, ast.Call) or not isinstance(item.func, ast.Name):
+            continue
+        if item.func.id != "ActionInputHandle":
+            continue
+        key_kw = next((kw for kw in item.keywords if kw.arg == "key"), None)
+        if key_kw is not None and isinstance(key_kw.value, ast.Constant):
+            keys.append(str(key_kw.value.value))
+    return keys
+
+
+def _action_output_handle_keys(method_name: str) -> List[str]:
+    decorator = _action_decorator_ast(method_name)
+    handles_kw = next((kw for kw in decorator.keywords if kw.arg == "handles"), None)
+    if handles_kw is None or not isinstance(handles_kw.value, ast.List):
+        return []
+    keys: List[str] = []
+    for item in handles_kw.value.elts:
+        if not isinstance(item, ast.Call) or not isinstance(item.func, ast.Name):
+            continue
+        if item.func.id != "ActionOutputHandle":
+            continue
+        key_kw = next((kw for kw in item.keywords if kw.arg == "key"), None)
+        if key_kw is not None and isinstance(key_kw.value, ast.Constant):
+            keys.append(str(key_kw.value.value))
+    return keys
+
+
 def _typed_dict_field_metadata(class_name: str, field_name: str) -> Dict[str, str]:
     cls = _ast_class(class_name)
     field = next(
@@ -267,12 +301,10 @@ def test_registry_surface_labels_follow_action_args_contract_ast() -> None:
     assert _action_handle_labels("batch_cancel_experiment")["order_codes"] == "实验编号列表*"
 
     start_doc = ast.get_docstring(_station_method_ast("start_experiment")) or ""
-    assert "materials_loaded[物料已装载*]" in start_doc
     assert "order_id[<order_id>*]" in start_doc
     assert "resultTable[<resultTable>]" in start_doc
 
     unload_doc = ast.get_docstring(_station_method_ast("unload_materials")) or ""
-    assert "materials_unloaded[物料已下料*]" in unload_doc
     assert "order_id[<order_id>*]" in unload_doc
     assert "resultTable[<resultTable>]" in unload_doc
 
@@ -281,7 +313,7 @@ def test_submit_param_field_metadata_uses_titles_and_user_facing_descriptions_as
     sample_meta = _typed_dict_field_metadata("PeptideDay2RequiredParams", "sample_excel_pattern")
     assert sample_meta == {
         "title": "样品excel名称*",
-        "description": "选择要提交的excel文件；如果已传入<sample_excel_pattern>，可填写空字符串。",
+        "description": "选择要提交的excel文件，如果上游已传入<sample_excel_relative_path>，可不填。",
     }
 
     order_name_meta = _typed_dict_field_metadata("PeptideCommonSubmitOptionalParams", "order_name")
@@ -528,15 +560,15 @@ def test_list_sample_excels_modes() -> None:
     ]
     station._list_sample_excels = MagicMock(return_value=records)  # type: ignore[method-assign]
 
-    info = station.list_sample_excels(sample_excel_pattern="DPR019-a", deterministic_resolve=False)
+    info = station.list_sample_excels(name_filter="DPR019-a", deterministic_resolve=False)
     assert "sample_excel_data" in info
     assert "sample_excel_relative_path" not in info
 
-    resolved = station.list_sample_excels(sample_excel_pattern="DPR019-a", deterministic_resolve=True)
+    resolved = station.list_sample_excels(name_filter="DPR019-a", deterministic_resolve=True)
     assert resolved["sample_excel_relative_path"] == "upload\\sample\\DPR019-a.xlsx"
 
     with pytest.raises(Exception):
-        station.list_sample_excels(sample_excel_pattern="DPR019", deterministic_resolve=True)
+        station.list_sample_excels(name_filter="DPR019", deterministic_resolve=True)
 
 
 def test_resolve_submit_sample_file_direct_path() -> None:
@@ -853,14 +885,14 @@ def test_prepare_cem_preserves_raw_pdf_path_but_normalizes_url() -> None:
 
 
 def test_prepare_cem_handle_keys() -> None:
-    cls = getattr(_import_module(), CLASS_NAME)
-    meta = getattr(cls.prepare_cem, "_action_registry_meta", {})
-    handle_keys = _action_handle_keys(meta)
-    assert "cem_method_file_name" in handle_keys
-    assert "sample_excel_relative_path" in handle_keys
-    assert "cem_pdf_path" in handle_keys
-    assert "cem_info_url" in handle_keys
-    assert "prepare_cem_response" in handle_keys
+    assert _action_input_handle_keys("prepare_cem") == [
+        "cem_method_file_name",
+        "sample_excel_relative_path",
+    ]
+    assert _action_output_handle_keys("prepare_cem") == [
+        "cem_method_file_name",
+        "cem_info_url",
+    ]
 
 
 def test_prepare_cem_rejects_missing_excel_path() -> None:
@@ -892,34 +924,26 @@ def test_confirm_cem_info_metadata_shape() -> None:
     assert meta.get("always_free") is True
     assert meta.get("placeholder_keys") == {"assignee_user_ids": "unilabos_manual_confirm"}
     assert meta.get("goal_default") == {
-        "cem_info_confirmed": False,
         "timeout_seconds": 3600,
         "assignee_user_ids": [],
     }
+    assert _action_input_handle_keys("confirm_cem_info") == [
+        "cem_info_url",
+        "cem_method_file_name",
+    ]
+    assert _action_output_handle_keys("confirm_cem_info") == []
 
 
-def test_confirm_cem_info_returns_instruction_after_confirmation() -> None:
+def test_confirm_cem_info_returns_instruction() -> None:
     station = _make_station()
     out = station.confirm_cem_info(
-        cem_pdf_path="/files/cem.pdf",
         cem_info_url="http://test/files/cem.pdf",
         cem_method_file_name="method.MPM",
-        sample_excel_relative_path="upload/sample/f.xlsx",
-        cem_info_confirmed=True,
     )
     assert out["success"] is True
-    assert out["cem_pdf_path"] == "/files/cem.pdf"
     assert out["cem_info_url"] == "http://test/files/cem.pdf"
     assert out["cem_method_file_name"] == "method.MPM"
-    assert out["sample_excel_relative_path"] == "upload\\sample\\f.xlsx"
-    assert "打开下述链接查看CEM校验信息" in out["instruction_text"]
-
-
-def test_confirm_cem_info_blocks_without_confirmation() -> None:
-    station = _make_station()
-    with pytest.raises(RuntimeError):
-        station.confirm_cem_info(cem_info_confirmed=False)
-
+    assert "打开下述链接查看 CEM 校验信息" in out["instruction_text"]
 
 # ---------------------------------------------------------------------------
 # 6. Allocation map parsing + resultTable
@@ -1228,7 +1252,6 @@ def test_display_values_manual_confirm_metadata_and_return() -> None:
     assert meta.get("goal_default") == {
         "title": "",
         "values": None,
-        "display_confirmed": False,
         "timeout_seconds": 3600,
         "assignee_user_ids": [],
     }
@@ -1243,20 +1266,12 @@ def test_display_values_manual_confirm_metadata_and_return() -> None:
     out = station.display_values_manual_confirm(
         title="报告文件",
         values=values,
-        display_confirmed=True,
         assignee_user_ids=["u1"],
     )
     assert out["success"] is True
     assert out["title"] == "报告文件"
     assert out["values"] == json.dumps(values, ensure_ascii=False, indent=2)
-    assert out["display_confirmed"] is True
     assert out["assignee_user_ids"] == ["u1"]
-
-
-def test_display_values_manual_confirm_blocks_without_confirmation() -> None:
-    station = _make_station()
-    with pytest.raises(RuntimeError, match="展示内容"):
-        station.display_values_manual_confirm(display_confirmed=False)
 
 
 def test_get_aggregated_order_report_is_todo_placeholder() -> None:
@@ -1306,19 +1321,20 @@ def test_station_fetch_workflow_list_uses_rpc() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 9. start_experiment 装载闸门
+# 9. start_experiment 装载展示
 # ---------------------------------------------------------------------------
 
 
-def test_start_experiment_blocks_when_materials_not_loaded() -> None:
+def test_start_experiment_starts_with_table_rows() -> None:
     station = _make_station()
     station.hardware_interface.scheduler_start.return_value = 1
-    with pytest.raises(RuntimeError):
-        station.start_experiment(
-            order_id=ORDER_GUID,
-            resultTable={"data": [{"materialName": "x"}]},
-            materials_loaded=False,
-        )
+    result = station.start_experiment(
+        order_id=ORDER_GUID,
+        resultTable={"data": [{"materialName": "x"}]},
+    )
+    assert result["success"] is True
+    assert result["order_ids"] == [ORDER_GUID]
+    assert result["resultTable"]["data"] == [{"materialName": "x"}]
 
 
 def test_start_experiment_starts_when_table_empty() -> None:
@@ -1377,7 +1393,6 @@ def test_reset_manual_metadata_shape() -> None:
     goal_default = meta.get("goal_default") or {}
     assert goal_default.get("timeout_seconds") == 3600
     assert goal_default.get("assignee_user_ids") == []
-    assert goal_default.get("physical_cleanup_confirmed") is False
 
 
 # --- plan §Tests 4: 两个 action 都暴露 4 个真实 bool 参数 ---
@@ -1457,25 +1472,25 @@ def test_reset_goal_defaults_first_three_true_devices_false() -> None:
         assert goal_default.get("reset_devices") is False, action_name
 
 
-# --- plan §Tests 8: reset_manual(physical_cleanup_confirmed=False) 不调任何 RPC ---
+# --- plan §Tests 8: reset_manual 直接执行所选复位 ---
 
 
-def test_reset_manual_blocks_when_not_confirmed() -> None:
+def test_reset_manual_defaults_call_three_and_skip_devices() -> None:
     station = _make_station()
+    rpc = station.hardware_interface
+    rpc.scheduler_reset.return_value = 1
+    rpc.reset_order_status.return_value = 1
+    rpc.reset_location.return_value = 1
     out = station.reset_manual(
         reset_scheduler=True,
         reset_order_status=True,
         reset_location=True,
-        reset_devices=True,
-        physical_cleanup_confirmed=False,
+        reset_devices=False,
     )
-    rpc = station.hardware_interface
-    rpc.scheduler_reset.assert_not_called()
-    rpc.reset_order_status.assert_not_called()
-    rpc.reset_location.assert_not_called()
+    rpc.scheduler_reset.assert_called_once_with()
+    rpc.reset_order_status.assert_called_once_with()
+    rpc.reset_location.assert_called_once_with()
     rpc.reset_devices.assert_not_called()
-    assert out["status"] == "blocked"
-    assert out["physical_cleanup_confirmed"] is False
     assert "请确认" in out["confirmation_message"]
 
 
@@ -1548,8 +1563,8 @@ def test_reset_auto_individual_checkboxes_drive_calls() -> None:
     assert skipped == {"reset_order_status", "reset_location", "reset_devices"}
 
 
-def test_reset_manual_after_confirmation_calls_same_helper() -> None:
-    """plan §reset_manual 执行规则：勾选确认后等价于 reset_auto。"""
+def test_reset_manual_calls_same_helper() -> None:
+    """plan §reset_manual 执行规则：等价于 reset_auto。"""
     station = _make_station()
     rpc = station.hardware_interface
     rpc.scheduler_reset.return_value = 1
@@ -1561,13 +1576,11 @@ def test_reset_manual_after_confirmation_calls_same_helper() -> None:
         reset_order_status=True,
         reset_location=True,
         reset_devices=True,
-        physical_cleanup_confirmed=True,
     )
     rpc.scheduler_reset.assert_called_once_with()
     rpc.reset_order_status.assert_called_once_with()
     rpc.reset_location.assert_called_once_with()
     rpc.reset_devices.assert_called_once_with()
-    assert out["physical_cleanup_confirmed"] is True
     assert out["confirmation_message"]
     assert [item["operation"] for item in out["executed_calls"]] == [
         "reset_scheduler",
@@ -1751,8 +1764,8 @@ def test_reset_paths_do_not_call_take_out_or_legacy_material_cache_refresh() -> 
     rpc.reset_devices.return_value = 1
 
     station.reset_auto(reset_devices=True)
-    station.reset_manual(physical_cleanup_confirmed=True, reset_devices=True)
-    station.reset_manual(physical_cleanup_confirmed=False)
+    station.reset_manual(reset_devices=True)
+    station.reset_manual()
 
     rpc.take_out.assert_not_called()
     refresh = getattr(rpc, "refresh_material_cache", None)
@@ -1834,6 +1847,7 @@ def test_new_actions_registered_on_class() -> None:
     module = _import_module()
     unload_meta = getattr(cls.unload_materials, "_action_registry_meta", {})
     assert unload_meta.get("node_type") == module.NodeType.MANUAL_CONFIRM
+    assert _action_input_handle_keys("unload_materials") == ["order_id", "resultTable"]
     wait_meta = getattr(cls.wait_for_order_finish, "_action_registry_meta", {})
     assert wait_meta.get("node_type") != module.NodeType.MANUAL_CONFIRM
     assert wait_meta.get("always_free") is True

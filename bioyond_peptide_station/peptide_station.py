@@ -122,7 +122,7 @@ RESET_MANUAL_CONFIRM_MESSAGE = (
     "请确认G3、CEM、Tecan、撕膜机、封膜机、打标机、旋转堆栈上下料位、3个转台等位置的物料已清理完毕；\n"
     "请开门检查冰箱、IDOT、酶标仪、离心机、LCMS内部没有遗留物料。"
 )
-CEM_INFO_CONFIRM_MESSAGE = "打开下述链接查看CEM校验信息，确认无误后勾选 CEM校验已确认。"
+CEM_INFO_CONFIRM_MESSAGE = "打开下述链接查看 CEM 校验信息，确认无误后继续。"
 RESULT_TABLE_COLUMNS = [
     {"name": "设备", "key": "whName"},
     {"name": "位置", "key": "locationCode"},
@@ -236,7 +236,7 @@ class PeptideGenericSubmitRequiredParams(TypedDict):
         str,
         Field(
             title="样品excel名称*",
-            description="选择要提交的excel文件；如果已传入<sample_excel_pattern>，可填写空字符串。",
+            description="选择要提交的excel文件；如果上游已传入<sample_excel_relative_path>，可不填。",
         ),
     ]
 
@@ -256,7 +256,7 @@ class PeptideDay1RequiredParams(TypedDict):
         str,
         Field(
             title="样品excel名称*",
-            description="选择要提交的excel文件；如果已传入<sample_excel_pattern>，可填写空字符串。",
+            description="选择要提交的excel文件，如果上游已传入<sample_excel_relative_path>，可不填。",
         ),
     ]
     cem_method_file_name: Annotated[
@@ -278,7 +278,7 @@ class PeptideDay2RequiredParams(TypedDict):
         str,
         Field(
             title="样品excel名称*",
-            description="选择要提交的excel文件；如果已传入<sample_excel_pattern>，可填写空字符串。",
+            description="选择要提交的excel文件，如果上游已传入<sample_excel_relative_path>，可不填。",
         ),
     ]
 
@@ -608,33 +608,28 @@ class BioyondPeptideStation(BioyondWorkstation):
     )
     def list_sample_excels(
         self,
-        begin_date: str = "",
+        begin_date: str = "2010-06-03T13:12:40.403+08:00",
         end_date: str = "",
         name_filter: str = "",
-        sample_excel_pattern: str = "",
         deterministic_resolve: bool = False,
     ) -> Dict[str, Any]:
         """查询已上传的样品表，必要时解析出唯一文件。
 
         Args:
-            sample_excel_pattern[样品excel名称*]: 选择要提交的excel文件；如果已传入<sample_excel_pattern>，可填写空字符串。
             name_filter[样品excel筛选关键字]: 按文件名关键字筛选样品表。
-            deterministic_resolve[确定解析唯一文件]: 要求筛选结果只能匹配一个样品表，并输出内部文件路径。
-            begin_date[开始日期]: 只查询该日期之后上传的样品表；未填写时不限。
-            end_date[结束日期]: 只查询该日期之前上传的样品表；未填写时不限。
+            deterministic_resolve[确定解析唯一文件]: 要求筛选结果只能匹配一个样品表，并输出内部文件路径<sample_excel_relative_path>。
+            begin_date[开始日期]: 只查询该日期之后上传的样品表，格式2010-06-03T13:12:40.403+08:00；未填写时不限。
+            end_date[结束日期]: 只查询该日期之前上传的样品表，格式2030-06-03T13:12:40.403+08:00；未填写时不限。
         """
         with self._debug_call_session("list_sample_excels"):
             records = self._list_sample_excels(
-                name_filter=name_filter or sample_excel_pattern.replace("*", ""),
+                name_filter=name_filter.replace("*", ""),
                 begin_date=begin_date or None,
                 end_date=end_date or None,
             )
             payload: Dict[str, Any] = {"success": True, "sample_excel_data": records}
             if deterministic_resolve:
-                pattern = sample_excel_pattern or name_filter
-                if not pattern:
-                    raise PeptideWorkflowError("确定性解析模式需要 sample_excel_pattern 或 name_filter")
-                selected = self._select_sample_excel_record(records, pattern)
+                selected = self._select_sample_excel_record(records, name_filter)
                 payload["sample_excel_relative_path"] = str(selected.get("relativePath") or "").replace("/", "\\")
                 payload["selected_sample_excel"] = selected
             return payload
@@ -754,7 +749,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         Args:
             required_params[必填参数*]: 填写本次实验必须提供的工作流、样品等参数。
             optional_params[可选参数]: 设置实验名称、物料同步、参数覆盖等可选行为。
-            sample_excel_relative_path[<sample_excel_relative_path>*]: 上传或查询样品表后返回的内部文件路径，通常由上游节点自动传入。
+            sample_excel_relative_path[<sample_excel_relative_path>]: 上传或查询样品表后返回的内部文件路径，通常由上游节点传入。
         """
         return self._submit_experiment_core(
             day_key=None,
@@ -799,7 +794,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         Args:
             required_params[必填参数*]: 填写本次实验必须提供的样品、工作流、方法等参数。
             optional_params[可选参数]: 设置实验名称、物料同步、参数覆盖等可选行为。
-            sample_excel_relative_path[<sample_excel_relative_path>*]: 上传或查询样品表后返回的内部文件路径，通常由上游节点自动传入。
+            sample_excel_relative_path[<sample_excel_relative_path>]: 上传或查询样品表后返回的内部文件路径，通常由上游节点传入。
         """
         return self._submit_experiment_core("day2", required_params, optional_params, sample_excel_relative_path)
 
@@ -838,7 +833,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         Args:
             required_params[必填参数*]: 填写本次实验必须提供的样品、工作流、方法等参数。
             optional_params[可选参数]: 设置实验名称、物料同步、参数覆盖等可选行为。
-            sample_excel_relative_path[<sample_excel_relative_path>*]: 上传或查询样品表后返回的内部文件路径，通常由上游节点自动传入。
+            sample_excel_relative_path[<sample_excel_relative_path>]: 上传或查询样品表后返回的内部文件路径，通常由上游节点传入。
         """
         return self._submit_experiment_core("day3", required_params, optional_params, sample_excel_relative_path)
 
@@ -877,7 +872,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         Args:
             required_params[必填参数*]: 填写本次实验必须提供的样品、工作流、方法等参数。
             optional_params[可选参数]: 设置实验名称、物料同步、参数覆盖等可选行为。
-            sample_excel_relative_path[<sample_excel_relative_path>*]: 上传或查询样品表后返回的内部文件路径，通常由上游节点自动传入。
+            sample_excel_relative_path[<sample_excel_relative_path>]: 上传或查询样品表后返回的内部文件路径，通常由上游节点传入。
         """
         return self._submit_experiment_core("day4", required_params, optional_params, sample_excel_relative_path)
 
@@ -916,7 +911,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         Args:
             required_params[必填参数*]: 填写本次实验必须提供的样品、工作流、方法等参数。
             optional_params[可选参数]: 设置实验名称、物料同步、参数覆盖等可选行为。
-            sample_excel_relative_path[<sample_excel_relative_path>*]: 上传或查询样品表后返回的内部文件路径，通常由上游节点自动传入。
+            sample_excel_relative_path[<sample_excel_relative_path>]: 上传或查询样品表后返回的内部文件路径，通常由上游节点传入。
         """
         return self._submit_experiment_core("day4_lcms", required_params, optional_params, sample_excel_relative_path)
 
@@ -956,7 +951,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         Args:
             required_params[必填参数*]: 填写本次实验必须提供的样品、CEM 方法等参数。
             optional_params[可选参数]: 设置实验名称、物料同步、参数覆盖等可选行为。
-            sample_excel_relative_path[<sample_excel_relative_path>*]: 上传或查询样品表后返回的内部文件路径，通常由上游节点自动传入。
+            sample_excel_relative_path[<sample_excel_relative_path>]: 上传或查询样品表后返回的内部文件路径，通常由上游节点传入。
         """
         required = dict(required_params or {})
         cem_method = str(required.get("cem_method_file_name") or DAY1_CEM_METHOD_DEFAULT).strip() or DAY1_CEM_METHOD_DEFAULT
@@ -986,18 +981,8 @@ class BioyondPeptideStation(BioyondWorkstation):
                 data_source=DataSource.HANDLE,
                 io_type="source",
             ),
-            ActionOutputHandle(key="success", data_type="bool", label="是否成功", data_key="success", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="cem_method_file_name", data_type="str", label="CEM方法文件", data_key="cem_method_file_name", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(
-                key="sample_excel_relative_path",
-                data_type="bioyond_sample_file",
-                label="<sample_excel_relative_path>",
-                data_key="sample_excel_relative_path",
-                data_source=DataSource.EXECUTOR,
-            ),
-            ActionOutputHandle(key="cem_pdf_path", data_type="str", label="CEM 校验文件路径", data_key="cem_pdf_path", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="cem_info_url", data_type="str", label="CEM 校验链接", data_key="cem_info_url", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(key="prepare_cem_response", data_type="json", label="CEM 校验结果", data_key="prepare_cem_response", data_source=DataSource.EXECUTOR),
         ],
     )
     def prepare_cem(
@@ -1046,66 +1031,35 @@ class BioyondPeptideStation(BioyondWorkstation):
         always_free=True,
         node_type=NodeType.MANUAL_CONFIRM,
         placeholder_keys={"assignee_user_ids": "unilabos_manual_confirm"},
-        goal_default={"cem_info_confirmed": False, "timeout_seconds": 3600, "assignee_user_ids": []},
+        goal_default={"timeout_seconds": 3600, "assignee_user_ids": []},
         feedback_interval=300,
         description=CEM_INFO_CONFIRM_MESSAGE,
         handles=[
-            ActionInputHandle(key="cem_pdf_path", data_type="str", label="CEM 校验文件路径", data_key="cem_pdf_path", data_source=DataSource.HANDLE, io_type="source"),
             ActionInputHandle(key="cem_info_url", data_type="str", label="CEM 校验链接", data_key="cem_info_url", data_source=DataSource.HANDLE, io_type="source"),
             ActionInputHandle(key="cem_method_file_name", data_type="str", label="CEM方法文件", data_key="cem_method_file_name", data_source=DataSource.HANDLE, io_type="source"),
-            ActionInputHandle(
-                key="sample_excel_relative_path",
-                data_type="bioyond_sample_file",
-                label="<sample_excel_relative_path>",
-                data_key="sample_excel_relative_path",
-                data_source=DataSource.HANDLE,
-                io_type="source",
-            ),
-            ActionOutputHandle(key="cem_pdf_path", data_type="str", label="CEM 校验文件路径", data_key="cem_pdf_path", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(key="cem_info_url", data_type="str", label="CEM 校验链接", data_key="cem_info_url", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(key="cem_method_file_name", data_type="str", label="CEM方法文件", data_key="cem_method_file_name", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(
-                key="sample_excel_relative_path",
-                data_type="bioyond_sample_file",
-                label="<sample_excel_relative_path>",
-                data_key="sample_excel_relative_path",
-                data_source=DataSource.EXECUTOR,
-            ),
-            ActionOutputHandle(key="instruction_text", data_type="str", label="确认说明", data_key="instruction_text", data_source=DataSource.EXECUTOR),
         ],
     )
     def confirm_cem_info(
         self,
-        cem_pdf_path: str = "",
         cem_info_url: str = "",
         cem_method_file_name: str = "",
-        sample_excel_relative_path: str = "",
-        cem_info_confirmed: bool = False,
         timeout_seconds: int = 3600,
         assignee_user_ids: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """人工确认 CEM 校验信息。
+        """展示 CEM 校验信息。
 
         Args:
-            cem_info_confirmed[CEM校验已确认*]: 操作员确认已核对 CEM 校验信息并允许继续。
             timeout_seconds[等待超时时间]: 人工确认或等待完成时允许等待的最长秒数；0 表示不限时。
             assignee_user_ids[确认人]: 指定需要完成人工确认的用户；为空时由默认流程处理。
             cem_method_file_name[CEM方法文件]: 本次 Day1 使用的 CEM 方法文件，通常由上游节点自动传入。
-            cem_pdf_path[<cem_pdf_path>]: 上游节点生成的 CEM 校验文件路径。
             cem_info_url[<cem_info_url>]: 上游节点生成的 CEM 校验文件链接。
-            sample_excel_relative_path[<sample_excel_relative_path>]: 上传或查询样品表后返回的内部文件路径，通常由上游节点自动传入。
         """
         del timeout_seconds, assignee_user_ids, kwargs
-        if not bool(cem_info_confirmed):
-            raise RuntimeError("CEM 校验信息未确认，拒绝继续工作流")
         return {
             "success": True,
-            "cem_pdf_path": str(cem_pdf_path or ""),
             "cem_info_url": str(cem_info_url or ""),
             "cem_method_file_name": str(cem_method_file_name or DAY1_CEM_METHOD_DEFAULT).strip() or DAY1_CEM_METHOD_DEFAULT,
-            "sample_excel_relative_path": str(sample_excel_relative_path or "").replace("/", "\\"),
-            "cem_info_confirmed": True,
             "instruction_text": CEM_INFO_CONFIRM_MESSAGE,
         }
 
@@ -1228,7 +1182,6 @@ class BioyondPeptideStation(BioyondWorkstation):
                     "order_id": order_id,
                     "order_ids": order_ids,
                     "resultTable": result_table,
-                    "materials_loaded": False,
                 },
                 "auto_register_materials": auto_register,
                 "material_registration": material_registration,
@@ -1239,9 +1192,9 @@ class BioyondPeptideStation(BioyondWorkstation):
         always_free=True,
         node_type=NodeType.MANUAL_CONFIRM,
         placeholder_keys={"assignee_user_ids": "unilabos_manual_confirm"},
-        goal_default={"materials_loaded": False, "timeout_seconds": 3600, "assignee_user_ids": [], "order_id": "", "order_ids": [], "resultTable": None},
+        goal_default={"timeout_seconds": 3600, "assignee_user_ids": [], "order_id": "", "order_ids": [], "resultTable": None},
         feedback_interval=300,
-        description="确认物料装载后启动调度器",
+        description="展示物料装载表后启动调度器",
         handles=[
             ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
             ActionInputHandle(key="order_ids", data_type="bioyond_order_ids", label="<order_ids>", data_key="order_ids", data_source=DataSource.HANDLE, io_type="source"),
@@ -1257,29 +1210,23 @@ class BioyondPeptideStation(BioyondWorkstation):
         order_id: str = "",
         order_ids: Optional[List[str]] = None,
         resultTable: Optional[Dict[str, Any]] = None,
-        materials_loaded: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """人工确认物料已装载，并启动调度器。
+        """展示物料装载表，并启动调度器。
 
         Args:
-            materials_loaded[物料已装载*]: 操作员确认已按装载确认表完成物料装载。
             order_id[<order_id>*]: 奔曜内部标识，通常由上游节点传入。
             order_ids[<order_ids>]: 奔曜内部标识列表，通常由上游节点传入。
             resultTable[<resultTable>]: 上游节点生成的操作指引表，用于人工确认装载或下料。
         """
         with self._debug_call_session("start_experiment"):
             resolved_order_ids = self._extract_order_ids(order_id=order_id, order_ids=order_ids, **kwargs)
-            table_rows = resultTable.get("data") if isinstance(resultTable, dict) else []
-            if table_rows and not materials_loaded:
-                raise RuntimeError("多肽物料装载未确认，拒绝启动调度器")
             result = self._run_scheduler_action("scheduler_start", "启动")
             result["order_id"] = resolved_order_ids[0] if resolved_order_ids else str(order_id or "")
             result["order_ids"] = resolved_order_ids
             # peptide 的 _run_scheduler_action 不返回 order_code；先占位空串，
             # 下游 wait_for_order_finish 会走 rpc.order_report(order_id).code 兜底反查。
             result["order_code"] = ""
-            result["materials_loaded"] = bool(materials_loaded)
             result["resultTable"] = resultTable or {}
             return result
 
@@ -1711,7 +1658,6 @@ class BioyondPeptideStation(BioyondWorkstation):
             "assignee_user_ids": "unilabos_manual_confirm",
         },
         goal_default={
-            "materials_unloaded": False,
             "timeout_seconds": 3600,
             "assignee_user_ids": [],
             "order_id": "",
@@ -1720,7 +1666,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         feedback_interval=300,
         description=(
             "展示上一节点整理的下料指引表；"
-            "操作员物理取出后勾选物料已下料，本节点再通知奔曜下料完成。"
+            "本节点通知奔曜下料完成。"
         ),
         handles=[
             ActionInputHandle(
@@ -1732,34 +1678,10 @@ class BioyondPeptideStation(BioyondWorkstation):
                 io_type="source",
             ),
             ActionInputHandle(
-                key="order_code",
-                data_type="bioyond_order_code",
-                label="实验编号",
-                data_key="order_code",
-                data_source=DataSource.HANDLE,
-                io_type="source",
-            ),
-            ActionInputHandle(
                 key="resultTable",
                 data_type="table",
                 label="下料指引表",
                 data_key="resultTable",
-                data_source=DataSource.HANDLE,
-                io_type="source",
-            ),
-            ActionInputHandle(
-                key="used_materials",
-                data_type="array",
-                label="使用物料列表",
-                data_key="used_materials",
-                data_source=DataSource.HANDLE,
-                io_type="source",
-            ),
-            ActionInputHandle(
-                key="order_finish_report",
-                data_type="object",
-                label="实验完成信息",
-                data_key="order_finish_report",
                 data_source=DataSource.HANDLE,
                 io_type="source",
             ),
@@ -1790,16 +1712,13 @@ class BioyondPeptideStation(BioyondWorkstation):
         self,
         order_id: str = "",
         resultTable: Optional[Dict[str, Any]] = None,
-        materials_unloaded: bool = False,
         timeout_seconds: int = 3600,
         assignee_user_ids: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """人工下料确认节点：勾选「已完成下料」后通知奔曜。
-        本节点展示下料指引表，并在确认后通知奔曜按当前实验完成下料。
+        """展示下料指引表，并通知奔曜按当前实验完成下料。
 
         Args:
-            materials_unloaded[物料已下料*]: 操作员确认已按下料指引表完成物料取出。
             timeout_seconds[等待超时时间]: 人工确认或等待完成时允许等待的最长秒数；0 表示不限时。
             assignee_user_ids[确认人]: 指定需要完成人工确认的用户；为空时由默认流程处理。
             order_id[<order_id>*]: 奔曜内部标识，通常由上游节点传入。
@@ -1816,9 +1735,6 @@ class BioyondPeptideStation(BioyondWorkstation):
                 raise ValueError(
                     "unload_materials 需要 order_id（请连接 wait_for_order_finish.order_id 或显式传入）"
                 )
-
-            if not self._as_manual_gate(materials_unloaded):
-                raise RuntimeError("下料未确认，拒绝通知奔曜完成下料")
 
             rpc = self._require_hardware_interface("take_out")
             order_material_ids = self._collect_order_material_ids(normalized_order_id)
@@ -1945,7 +1861,6 @@ class BioyondPeptideStation(BioyondWorkstation):
             "sync_materials_after_reset": True,
             "clear_stale_after_reset": True,
             "publish_tree_after_reset": True,
-            "physical_cleanup_confirmed": False,
             "timeout_seconds": 3600,
             "assignee_user_ids": [],
         },
@@ -1961,16 +1876,14 @@ class BioyondPeptideStation(BioyondWorkstation):
         sync_materials_after_reset: bool = True,
         clear_stale_after_reset: bool = True,
         publish_tree_after_reset: bool = True,
-        physical_cleanup_confirmed: bool = False,
         timeout_seconds: int = 3600,
         assignee_user_ids: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """人工确认物理清理完毕后执行复位。
+        """展示物理清理提示后执行复位。
 
-        操作员需先按弹窗提示完成 G3/CEM/Tecan/撕膜机/封膜机/打标机/旋转堆栈/3 个转台
-        等位置的物料清理，并开门检查冰箱/IDOT/酶标仪/离心机/LCMS 内部无遗留，再勾选
-        物理清理确认后，节点才会真正执行复位。
+        操作员可按弹窗提示完成 G3/CEM/Tecan/撕膜机/封膜机/打标机/旋转堆栈/3 个转台
+        等位置的物料清理，并开门检查冰箱/IDOT/酶标仪/离心机/LCMS 内部无遗留。
 
         Args:
             reset_scheduler[调度器复位]: 清空调度器当前状态，准备重新下发任务。
@@ -1980,31 +1893,11 @@ class BioyondPeptideStation(BioyondWorkstation):
             sync_materials_after_reset[复位后同步物料]: 复位完成后同步奔曜库存到本地资源树。
             clear_stale_after_reset[同步时清理陈旧物料]: 复位后删除所有奔曜端不存在的陈旧物料。
             publish_tree_after_reset[同步后发布资源树]: 同步成功后刷新前端资源树。
-            physical_cleanup_confirmed[物理清理确认*]: 操作员确认已按弹窗提示完成物料检查和现场清理。
             timeout_seconds[等待超时时间]: 人工确认或等待完成时允许等待的最长秒数；0 表示不限时。
             assignee_user_ids[确认人]: 指定需要完成人工确认的用户；为空时由默认流程处理。
         """
         del kwargs, timeout_seconds, assignee_user_ids
         with self._debug_call_session("reset_manual"):
-            if not bool(physical_cleanup_confirmed):
-                logger.info("[reset_manual] 物理清理未确认，拒绝执行复位 RPC")
-                return {
-                    "status": "blocked",
-                    "physical_cleanup_confirmed": False,
-                    "confirmation_message": RESET_MANUAL_CONFIRM_MESSAGE,
-                    "selected_operations": self._build_selected_operations_summary(
-                        reset_scheduler=bool(reset_scheduler),
-                        reset_order_status=bool(reset_order_status),
-                        reset_location=bool(reset_location),
-                        reset_devices=bool(reset_devices),
-                    ),
-                    "executed_calls": [],
-                    "skipped_operations": [
-                        {"operation": op, "reason": "physical_cleanup_not_confirmed"}
-                        for op in RESET_OPERATION_KEYS
-                    ],
-                    "warnings": ["physical_cleanup_not_confirmed"],
-                }
             payload = self._execute_reset_operations(
                 reset_scheduler=bool(reset_scheduler),
                 reset_order_status=bool(reset_order_status),
@@ -2017,7 +1910,6 @@ class BioyondPeptideStation(BioyondWorkstation):
                 clear_stale_after_reset=bool(clear_stale_after_reset),
                 publish_tree_after_reset=bool(publish_tree_after_reset),
             )
-            payload["physical_cleanup_confirmed"] = True
             payload["confirmation_message"] = RESET_MANUAL_CONFIRM_MESSAGE
             return payload
 
@@ -2092,25 +1984,25 @@ class BioyondPeptideStation(BioyondWorkstation):
     def get_order_list(
         self,
         status: OrderStatus = '全部（""）',
-        max_results: int = 10,
         filter_text: str = "",
-        sorting: str = "creationTime desc",
         skipCount: int = 0,
+        max_results: int = 10,
+        latest_only: bool = True,
+        sorting: str = "creationTime desc",
         timeType: str = "",
         beginTime: Optional[str] = None,
         endTime: Optional[str] = None,
-        latest_only: bool = True,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """查询实验列表，并输出可连接下游节点的实验标识。
 
         Args:
             status[实验状态*]: 选择要查询的实验状态。
+            filter_text[筛选文本]: 按实验名称进行筛选。
+            skipCount[跳过数量]: 跳过前若干条匹配记录。
             max_results[最大返回数]: 限制最多返回多少条实验记录。
-            filter_text[筛选文本]: 按实验编号、实验名称等文本筛选。
             latest_only[仅返回最新实验]: 只取最新一条匹配记录，便于连接下游节点。
             sorting[排序规则]: 设置实验列表排序方式；通常保持默认。
-            skipCount[跳过数量]: 跳过前若干条匹配记录。
             timeType[时间类型]: 选择按哪类时间范围筛选；未填写时不限。
             beginTime[开始时间]: 只查询该时间之后的实验；未填写时不限。
             endTime[结束时间]: 只查询该时间之前的实验；未填写时不限。
@@ -2413,12 +2305,11 @@ class BioyondPeptideStation(BioyondWorkstation):
         goal_default={
             "title": "",
             "values": None,
-            "display_confirmed": False,
             "timeout_seconds": 3600,
             "assignee_user_ids": [],
         },
         feedback_interval=300,
-        description="展示上游传入的任意内容，并等待人工确认",
+        description="展示上游传入的任意内容",
         handles=[
             ActionInputHandle(key="values", data_type="str", label="内容", data_key="values", data_source=DataSource.HANDLE, io_type="source"),
             ActionInputHandle(key="assignee_user_ids", data_type="array", label="确认人", data_key="assignee_user_ids", data_source=DataSource.HANDLE, io_type="source"),
@@ -2430,30 +2321,25 @@ class BioyondPeptideStation(BioyondWorkstation):
         self,
         title: str = "",
         values: Any = None,
-        display_confirmed: bool = False,
         timeout_seconds: int = 3600,
         assignee_user_ids: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """人工确认展示内容已查看。
+        """展示上游传入的任意内容。
 
         Args:
-            display_confirmed[内容已确认*]: 操作员确认已查看展示内容。
             timeout_seconds[等待超时时间]: 人工确认或等待完成时允许等待的最长秒数；0 表示不限时。
             assignee_user_ids[确认人]: 指定需要完成人工确认的用户；为空时由默认流程处理。
             title[标题]: 给展示内容设置标题。
             values[内容]: 需要展示的文本、表格或其他上游内容。
         """
         del timeout_seconds, kwargs
-        if not self._as_manual_gate(display_confirmed):
-            raise RuntimeError("展示内容尚未确认")
         return {
             "success": True,
             "title": str(title or ""),
             "values": self._display_text(values),
-            "display_confirmed": True,
             "assignee_user_ids": list(assignee_user_ids or []),
-            "instruction_text": "请查看内容，确认完成后勾选内容已确认。",
+            "instruction_text": "请查看内容。",
         }
 
     # ---------- 样品 Excel ----------
@@ -2979,20 +2865,6 @@ class BioyondPeptideStation(BioyondWorkstation):
             "pre_intakes_count": len(self._as_list(raw.get("preIntakes"))),
             "result_list_count": len(self._as_list(raw.get("resultList"))),
         }
-
-    # ---------- wait_for_order_finish / unload_materials 辅助 ----------
-
-    @staticmethod
-    def _as_manual_gate(value: Any) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"true", "1", "yes", "y", "on", "checked"}:
-                return True
-            if normalized in {"false", "0", "no", "n", "off", "unchecked", ""}:
-                return False
-        return bool(value)
 
     @staticmethod
     def _display_text(value: Any) -> str:
