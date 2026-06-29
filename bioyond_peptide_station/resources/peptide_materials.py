@@ -155,39 +155,44 @@ def _make_tip(max_volume_ul: float, total_tip_length: float, fitting_depth: floa
 
 
 def _make_96_well_plate_ordered_items(deep: bool = False) -> dict[str, Well]:
-    if deep:
-        return create_ordered_items_2d(
-            Well,
-            num_items_x=12,
-            num_items_y=8,
-            dx=10.9,
-            dy=8.25,
-            dz=2.0,
-            item_dx=9.0,
-            item_dy=9.0,
-            size_x=8.2,
-            size_y=8.2,
-            size_z=42.0,
-            max_volume=2200,
-            cross_section_type=CrossSectionType.RECTANGLE,
-            bottom_type=WellBottomType.V,
-        )
-    return create_ordered_items_2d(
-        Well,
-        num_items_x=12,
-        num_items_y=8,
-        dx=10.98,
-        dy=7.84,
-        dz=1.7,
-        item_dx=9.0,
-        item_dy=9.0,
-        size_x=6.8,
-        size_y=6.8,
-        size_z=10.5,
-        max_volume=350,
-        cross_section_type=CrossSectionType.CIRCLE,
-        bottom_type=WellBottomType.FLAT,
-    )
+    # 暂时不生成 96 个 well：完整 well 几何使资源树序列化体积过大，拖垮前后端通信。
+    # 返回空 dict，使 96 孔板序列化为零子节点的空板（PLR 接受空 ordered_items）。
+    # Bioyond detail/details 行不再映射成物理 well 内容。
+    # 如需恢复 96 个孔，取消下方注释并删除 `return {}`。
+    return {}
+    # if deep:
+    #     return create_ordered_items_2d(
+    #         Well,
+    #         num_items_x=12,
+    #         num_items_y=8,
+    #         dx=10.9,
+    #         dy=8.25,
+    #         dz=2.0,
+    #         item_dx=9.0,
+    #         item_dy=9.0,
+    #         size_x=8.2,
+    #         size_y=8.2,
+    #         size_z=42.0,
+    #         max_volume=2200,
+    #         cross_section_type=CrossSectionType.RECTANGLE,
+    #         bottom_type=WellBottomType.V,
+    #     )
+    # return create_ordered_items_2d(
+    #     Well,
+    #     num_items_x=12,
+    #     num_items_y=8,
+    #     dx=10.98,
+    #     dy=7.84,
+    #     dz=1.7,
+    #     item_dx=9.0,
+    #     item_dy=9.0,
+    #     size_x=6.8,
+    #     size_y=6.8,
+    #     size_z=10.5,
+    #     max_volume=350,
+    #     cross_section_type=CrossSectionType.CIRCLE,
+    #     bottom_type=WellBottomType.FLAT,
+    # )
 
 
 def _make_384_well_plate_ordered_items() -> dict[str, Well]:

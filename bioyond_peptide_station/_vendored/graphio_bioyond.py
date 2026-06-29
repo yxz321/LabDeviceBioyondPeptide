@@ -178,6 +178,17 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
     def _is_synthesis_base(resource):
         return getattr(resource, "model", None) == "bioyond_peptide_96_well_synthesis_plate_base"
 
+    def _is_empty_itemized_plate(resource):
+        model = str(getattr(resource, "model", "") or "")
+        category = getattr(resource, "category", None)
+        categories = category if isinstance(category, (list, tuple, set)) else [category]
+        is_plate = "plate" in categories or model.startswith("bioyond_peptide_96_well_") or "384" in model
+        return (
+            is_plate
+            and hasattr(resource, "get_item")
+            and len(getattr(resource, "children", []) or []) == 0
+        )
+
     def _clear_site_if_current(parent, child):
         sites = getattr(parent, "sites", None)
         if isinstance(sites, list):
@@ -555,7 +566,13 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
                 and hasattr(plr_material, "num_items")
                 and len(getattr(plr_material, "children", []) or []) > 0
             )
-            if not has_itemized_children:
+            skip_physical_details = _is_empty_itemized_plate(plr_material)
+            if skip_physical_details:
+                logger.debug(
+                    f"  └─ [子物料] {plr_material.name} 是无 well 子节点板，"
+                    f"保留 {len(material['detail'])} 条 Bioyond detail 到 unilabos_extra"
+                )
+            elif not has_itemized_children:
                 for bottle in reversed(plr_material.children):
                     plr_material.unassign_child_resource(bottle)
             child_ids = []
@@ -565,7 +582,7 @@ def resource_bioyond_to_plr(bioyond_materials: list[dict], type_mapping: Dict[st
             parent_type_name = str(material.get("typeName") or material.get("materialTypeName") or "")
             default_detail_type = "样品瓶" if "样品板" in parent_type_name else None
 
-            for detail in material["detail"]:
+            for detail in [] if skip_physical_details else material["detail"]:
                 number = (
                     (detail.get("z", 0) - 1) * plr_material.num_items_x * plr_material.num_items_y
                     + (detail.get("y", 0) - 1) * plr_material.num_items_y

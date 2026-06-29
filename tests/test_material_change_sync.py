@@ -240,6 +240,67 @@ def _assert_published_deck(station: Any, expected_count: int = 1) -> None:
     assert station.deck not in resources
 
 
+def test_96_well_plate_resources_do_not_create_well_children(runtime: SimpleNamespace) -> None:
+    from bioyond_peptide_station.resources import peptide_materials
+
+    plate_classes = [
+        peptide_materials.BioyondPeptide_96WellDeepWellPlate,
+        peptide_materials.BioyondPeptide_96WellSynthesisPlate,
+        peptide_materials.BioyondPeptide_96WellCollectionPlate,
+        peptide_materials.BioyondPeptide_96WellBalancePlate,
+        peptide_materials.BioyondPeptide_96WellAssayPlate,
+        peptide_materials.BioyondPeptide_96WellCarboxylicAcidPlate,
+        peptide_materials.BioyondPeptide_96WellStandardCurveAssayPlate,
+    ]
+
+    for plate_cls in plate_classes:
+        plate = plate_cls(name=plate_cls.resource_id)
+        assert list(getattr(plate, "children", []) or []) == []
+
+
+def test_material_change_detail_rows_are_metadata_for_empty_96_well_plate(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: SimpleNamespace,
+) -> None:
+    station = _fresh_station(monkeypatch, runtime)
+    material = _material("details-96", "96孔收集板", name="明细收集板", x=1, y=1)
+    material["detail"] = [
+        {"name": "多肽A", "typeName": None, "x": 1, "y": 1, "z": 1, "quantity": 12.5, "code": "P-A"},
+        {"name": "多肽B", "typeName": None, "x": 2, "y": 1, "z": 1, "quantity": 7.0, "code": "P-B"},
+    ]
+
+    station.process_material_change_report(material)
+
+    resource = _resource_by_bioyond_id(station.deck, "details-96")
+    assert resource is not None
+    assert list(getattr(resource, "children", []) or []) == []
+    extra = getattr(resource, "unilabos_extra", {}) or {}
+    assert extra["bioyond_material_details"] == material["detail"]
+    assert "bioyond_material_detail_contents" not in extra
+    assert _slot(station, "1-1") is resource
+
+
+def test_full_sync_detail_rows_are_metadata_for_empty_96_well_plate(runtime: SimpleNamespace) -> None:
+    row = _material("full-sync-details-96", "96孔收集板", name="全量明细收集板", x=1, y=1)
+    row["detail"] = [
+        {"name": "全量多肽", "typeName": None, "x": 1, "y": 1, "z": 1, "quantity": 3.5, "code": "P-F"}
+    ]
+
+    resources = runtime.station_module.resource_bioyond_to_plr(
+        [row],
+        type_mapping=runtime.material_type_mappings,
+    )
+
+    assert len(resources) == 1
+    resource = resources[0]
+    assert list(getattr(resource, "children", []) or []) == []
+    extra = getattr(resource, "unilabos_extra", {}) or {}
+    assert "bioyond_material_details" not in extra
+    assert "bioyond_material_detail_contents" not in extra
+    assert "detail_contents" not in extra["bioyond_material"]
+    assert extra["bioyond_material"]["details"] == row["detail"]
+
+
 def test_material_change_add_registers_material_on_deck_and_publishes(
     monkeypatch: pytest.MonkeyPatch,
     runtime: SimpleNamespace,
