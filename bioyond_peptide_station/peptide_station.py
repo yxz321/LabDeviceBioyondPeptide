@@ -157,6 +157,20 @@ ORDER_STATUS_VALUE_MAP: Dict[str, str] = {
     "60": "60",
     "100": "100",
 }
+ErrorHandlingChoice = Literal["retry", "skip", "end_experiment"]
+ERROR_HANDLING_CHOICE_TO_OPTION: Dict[str, int] = {
+    "retry": 1,
+    "skip": 2,
+    "end_experiment": 5,
+}
+ERROR_HANDLING_AVAILABLE_OPTIONS: Tuple[Dict[str, Any], ...] = (
+    {"choice": "retry", "bioyond_option": 1, "label": "重试当前步骤"},
+    {"choice": "skip", "bioyond_option": 2, "label": "跳过当前步骤"},
+    {"choice": "end_experiment", "bioyond_option": 5, "label": "结束实验"},
+)
+DEFAULT_ERROR_HANDLING_IGNORE_TEXTS: Tuple[str, ...] = (
+    "Executor LabelPrinterA failed while running BY_Print.",
+)
 MATERIAL_TYPE_ORDER = ("Sample", "Consumables", "Reagent")
 PEPTIDE_SAMPLE_FILE_KEY = "SampleFile"
 DAY1_CEM_METHOD_KEY = "CEMMethodFileName"
@@ -181,6 +195,20 @@ DAY_WORKFLOW_BINDINGS: Dict[str, Dict[str, str]] = {
 
 class PeptideWorkflowError(RuntimeError):
     """多肽工作流可恢复错误。"""
+
+
+def build_scheduler_error_handling_reply_data(
+    error_report: Dict[str, Any],
+    reply_option: int,
+    *,
+    creation_time: Optional[str] = None,
+) -> Dict[str, Any]:
+    """懒加载 Bioyond RPC 构造器，避免导入工作站模块时强依赖运行时通信栈。"""
+    from bioyond_peptide_station._vendored.bioyond_rpc import (
+        build_scheduler_error_handling_reply_data as _build_reply_data,
+    )
+
+    return _build_reply_data(error_report, reply_option, creation_time=creation_time)
 
 
 class PeptideCommonSubmitOptionalParams(TypedDict, total=False):
@@ -418,6 +446,10 @@ class BioyondPeptideStation(BioyondWorkstation):
         self.last_order_report: Optional[Dict[str, Any]] = None
         self.last_order_material_sync: Optional[Dict[str, Any]] = None
         self.last_used_materials: List[Any] = []
+        self.error_handling_event = threading.Event()
+        self.error_handling_lock = threading.Lock()
+        self.error_queue: List[Dict[str, Any]] = []
+        self.error_in_flight: Dict[str, Dict[str, Any]] = {}
         logger.info("BioyondPeptideStation 初始化完成: %s", self.bioyond_config.get("api_host", ""))
 
     @action(always_free=True, description="从 Bioyond 全量同步物料并发布资源树")
@@ -524,7 +556,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         return nullcontext()
 
     def handle_external_error(self, error_data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理奔曜错误报送，并为后续 SSE 人工选择回复预留上下文。"""
+        """处理奔曜错误报送，并排队等待人工选择回复。"""
         parent_handler = getattr(super(), "handle_external_error", None)
         if parent_handler is not None:
             base_result = parent_handler(error_data)
@@ -534,26 +566,494 @@ class BioyondPeptideStation(BioyondWorkstation):
                 "error_type": "bioyond_error" if isinstance(error_data, dict) and "code" in error_data else "unknown",
                 "timestamp": datetime.now().isoformat(),
             }
-        if not isinstance(error_data, dict) or not any(
-            error_data.get(key) for key in ("ijk", "token", "optionMessage")
-        ):
+        if not isinstance(error_data, dict) or not (error_data.get("ijk") and error_data.get("token")):
             return base_result
 
+        self._ensure_error_handling_state()
+        token = str(error_data.get("token") or "").strip()
+        item = {
+            "token": token,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "error_report": dict(error_data),
+            "status": "pending",
+            "base_result": base_result,
+        }
+        with self.error_handling_lock:
+            self.error_queue.append(item)
+            queued_count = len(self.error_queue)
+            self.error_handling_event.set()
+
+        logger.error(
+            "[peptide] 奔曜调度错误已入队: token=%s task=%s code=%s queue=%s",
+            token,
+            error_data.get("task"),
+            error_data.get("code"),
+            queued_count,
+        )
         result = dict(base_result) if isinstance(base_result, dict) else {"base_result": base_result}
         result.update(
             {
-                "reply_status": "pending_sse_option",
-                "error_reply_context": {
-                    "ijk": error_data.get("ijk"),
-                    "token": error_data.get("token"),
-                    "optionMessage": error_data.get("optionMessage"),
-                },
+                "reply_status": "pending_manual_confirm",
+                "token": token,
+                "queued_error_count": queued_count,
             }
         )
-        # TODO: 待错误 SSE/人工确认工具提供 reply_option 后，调用
-        # build_scheduler_error_handling_reply_data(error_data, reply_option)，
-        # 再通过 self._require_hardware_interface().scheduler_reply_error_handling(reply_data) 回复奔曜。
         return result
+
+    def _ensure_error_handling_state(self) -> None:
+        """兼容 object.__new__ 构造的离线测试实例。"""
+        if getattr(self, "error_handling_event", None) is None:
+            self.error_handling_event = threading.Event()
+        if getattr(self, "error_handling_lock", None) is None:
+            self.error_handling_lock = threading.Lock()
+        if not isinstance(getattr(self, "error_queue", None), list):
+            self.error_queue = []
+        if not isinstance(getattr(self, "error_in_flight", None), dict):
+            self.error_in_flight = {}
+
+    def _refresh_error_handling_event_locked(self) -> None:
+        if self.error_queue:
+            self.error_handling_event.set()
+        else:
+            self.error_handling_event.clear()
+
+    def _error_handling_token_from_report(self, error_report: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(error_report, dict):
+            return ""
+        return str(error_report.get("token") or "").strip()
+
+    def _error_handling_token_from_item(self, item: Dict[str, Any]) -> str:
+        token = str(item.get("token") or "").strip()
+        if token:
+            return token
+        return self._error_handling_token_from_report(dict(item.get("error_report") or {}))
+
+    def _claim_next_error_handling_item(self) -> Optional[Dict[str, Any]]:
+        self._ensure_error_handling_state()
+        with self.error_handling_lock:
+            if not self.error_queue:
+                self.error_handling_event.clear()
+                return None
+            item = self.error_queue.pop(0)
+            item["status"] = "claimed"
+            self._refresh_error_handling_event_locked()
+            remaining = len(self.error_queue)
+        logger.info(
+            "[peptide] wait_for_error_handling 领取错误: token=%s remaining_queue=%s",
+            self._error_handling_token_from_item(item),
+            remaining,
+        )
+        return item
+
+    def _claim_error_handling_item_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+        self._ensure_error_handling_state()
+        normalized_token = str(token or "").strip()
+        if not normalized_token:
+            return None
+        with self.error_handling_lock:
+            item = self.error_in_flight.get(normalized_token)
+            if item is not None:
+                return item
+            for index, queued_item in enumerate(self.error_queue):
+                if self._error_handling_token_from_item(queued_item) == normalized_token:
+                    item = self.error_queue.pop(index)
+                    item["status"] = "claimed_for_reply"
+                    self._refresh_error_handling_event_locked()
+                    return item
+        return None
+
+    def _store_error_handling_in_flight(self, item: Dict[str, Any], status: str = "in_flight") -> None:
+        self._ensure_error_handling_state()
+        item["status"] = status
+        token = self._error_handling_token_from_item(item)
+        if not token:
+            raise ValueError("error_handling item 缺少 token")
+        item["token"] = token
+        with self.error_handling_lock:
+            self.error_in_flight[token] = item
+
+    def _normalize_error_ignore_texts(self, ignore_errors_with: Optional[List[str]]) -> List[str]:
+        raw_values: Iterable[Any]
+        if ignore_errors_with is None:
+            raw_values = DEFAULT_ERROR_HANDLING_IGNORE_TEXTS
+        elif isinstance(ignore_errors_with, str):
+            raw_values = [ignore_errors_with]
+        else:
+            raw_values = ignore_errors_with
+        normalized: List[str] = []
+        for item in raw_values:
+            text = str(item or "").strip()
+            if text:
+                normalized.append(text)
+        return normalized
+
+    def _match_ignored_error_text(self, error_report: Dict[str, Any], ignore_texts: List[str]) -> Optional[str]:
+        err_inner_message = str(error_report.get("errInnerMessage") or "")
+        for ignore_text in ignore_texts:
+            if ignore_text and ignore_text in err_inner_message:
+                return ignore_text
+        return None
+
+    def _error_handling_message(self, error_report: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for key in ("errMessage", "errInnerMessage", "errInnerMessage2", "errInnerMessage3"):
+            value = str(error_report.get(key) or "").strip()
+            if value:
+                parts.append(value)
+        return "\n".join(parts)
+
+    def _error_handling_confirmation_message(self, error_report: Dict[str, Any]) -> str:
+        task = str(error_report.get("task") or "unknown").strip()
+        code = str(error_report.get("code") or "unknown").strip()
+        message = self._error_handling_message(error_report) or "未提供错误详情"
+        return f"奔曜调度错误待处理: task={task}, code={code}\n{message}"
+
+    def _format_error_handling_wait_result(
+        self,
+        item: Dict[str, Any],
+        *,
+        auto_handled_errors: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        error_report = dict(item.get("error_report") or {})
+        token = self._error_handling_token_from_item(item)
+        return {
+            "success": True,
+            "error_handling_status": "received",
+            "requires_manual_reply": True,
+            "token": token,
+            "error_report": error_report,
+            "task": error_report.get("task"),
+            "code": error_report.get("code"),
+            "error_message": self._error_handling_message(error_report),
+            "optionMessage": error_report.get("optionMessage"),
+            "available_options": [dict(item) for item in ERROR_HANDLING_AVAILABLE_OPTIONS],
+            "auto_handled_errors": list(auto_handled_errors or []),
+            "confirmation_message": self._error_handling_confirmation_message(error_report),
+        }
+
+    def _format_error_handling_timeout_result(
+        self,
+        auto_handled_errors: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "success": False,
+            "error_handling_status": "timeout",
+            "requires_manual_reply": False,
+            "token": "",
+            "error_report": {},
+            "task": None,
+            "code": None,
+            "error_message": "",
+            "optionMessage": None,
+            "available_options": [dict(item) for item in ERROR_HANDLING_AVAILABLE_OPTIONS],
+            "auto_handled_errors": list(auto_handled_errors or []),
+            "confirmation_message": "等待奔曜错误处理报送超时",
+        }
+
+    def _reply_scheduler_error_handling(self, error_report: Dict[str, Any], reply_option: int) -> Tuple[int, Dict[str, Any]]:
+        reply_data = build_scheduler_error_handling_reply_data(error_report, reply_option)
+        rpc = self._require_hardware_interface("scheduler_reply_error_handling")
+        result_code = rpc.scheduler_reply_error_handling(reply_data)
+        return int(result_code or 0), reply_data
+
+    def _auto_skip_error_handling_item(
+        self,
+        item: Dict[str, Any],
+        matched_ignore_text: str,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        error_report = dict(item.get("error_report") or {})
+        token = self._error_handling_token_from_item(item)
+        summary: Dict[str, Any] = {
+            "token": token,
+            "matched_ignore_text": matched_ignore_text,
+            "reply_option": 2,
+            "reply_result": 0,
+        }
+        try:
+            result_code, reply_data = self._reply_scheduler_error_handling(error_report, 2)
+            summary["reply_result"] = result_code
+            summary["reply_data"] = reply_data
+        except Exception as exc:
+            item["reply_failure"] = str(exc)
+            summary["error"] = str(exc)
+            self._store_error_handling_in_flight(item, status="auto_skip_failed")
+            logger.error(
+                "[peptide] 错误 %s 自动 skip 回复失败，保留人工处理: %s",
+                token,
+                exc,
+                exc_info=True,
+            )
+            return False, summary
+
+        if result_code == 1:
+            item["status"] = "auto_skipped"
+            logger.warning(
+                "[peptide] 错误 %s automatically handled by skip: 命中忽略规则 %s; errInnerMessage=%s; reply_result=%s",
+                token,
+                matched_ignore_text,
+                error_report.get("errInnerMessage"),
+                result_code,
+            )
+            return True, summary
+
+        item["reply_failure"] = f"scheduler_reply_error_handling 返回 {result_code}"
+        self._store_error_handling_in_flight(item, status="auto_skip_failed")
+        logger.error(
+            "[peptide] 错误 %s 自动 skip 回复失败，返回码=%s，保留人工处理",
+            token,
+            result_code,
+        )
+        return False, summary
+
+    @action(
+        always_free=True,
+        goal_default={
+            "timeout_seconds": 36000,
+            "poll_mode": True,
+            "poll_interval_seconds": 0.5,
+            "ignore_errors_with": ["Executor LabelPrinterA failed while running BY_Print."],
+        },
+        description="等待奔曜调度异常；可自动跳过已知可忽略错误，其余异常交给人工确认。",
+        handles=[
+            ActionOutputHandle(key="available_options", data_type="array", label="可选处理方式", data_key="available_options", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="token", data_type="str", label="错误标识", data_key="token", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="error_report", data_type="object", label="错误详情", data_key="error_report", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="error_message", data_type="str", label="错误说明", data_key="error_message", data_source=DataSource.EXECUTOR),
+        ],
+    )
+    def wait_for_error_handling(
+        self,
+        timeout_seconds: int = 36000,
+        ignore_errors_with: Optional[List[str]] = None,
+        poll_mode: bool = True,
+        poll_interval_seconds: float = 0.5,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """等待奔曜调度错误，默认自动 skip 已知可忽略的打标机错误。
+
+        Args:
+            timeout_seconds[等待超时时间]: 等待错误推送的最长秒数；0 或负数表示不设置超时。
+            ignore_errors_with[自动跳过错误文本]: 错误说明包含这些文本时自动选择“跳过当前步骤”；填空列表时禁用默认规则。
+            poll_mode[定时检查模式]: 没有新错误时按间隔醒来检查队列；关闭后仅等待新错误通知或超时。
+            poll_interval_seconds[定时检查间隔]: 定时检查时每次检查之间的秒数。
+        """
+        del kwargs
+        self._ensure_error_handling_state()
+        ignore_texts = self._normalize_error_ignore_texts(ignore_errors_with)
+        auto_handled_errors: List[Dict[str, Any]] = []
+        timeout_effective: Optional[float] = float(timeout_seconds) if timeout_seconds and timeout_seconds > 0 else None
+        deadline = (time.monotonic() + timeout_effective) if timeout_effective is not None else None
+
+        with self._debug_call_session("wait_for_error_handling"):
+            while True:
+                candidate = self._claim_next_error_handling_item()
+                if candidate is not None:
+                    error_report = dict(candidate.get("error_report") or {})
+                    matched_ignore_text = self._match_ignored_error_text(error_report, ignore_texts)
+                    if matched_ignore_text:
+                        auto_skipped, summary = self._auto_skip_error_handling_item(candidate, matched_ignore_text)
+                        auto_handled_errors.append(summary)
+                        if auto_skipped:
+                            continue
+                        return self._format_error_handling_wait_result(
+                            candidate,
+                            auto_handled_errors=auto_handled_errors,
+                        )
+
+                    self._store_error_handling_in_flight(candidate, status="in_flight")
+                    return self._format_error_handling_wait_result(
+                        candidate,
+                        auto_handled_errors=auto_handled_errors,
+                    )
+
+                if deadline is None:
+                    wait_timeout: Optional[float] = max(float(poll_interval_seconds or 0.5), 0.001) if poll_mode else None
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.warning("[peptide] wait_for_error_handling 超时")
+                        return self._format_error_handling_timeout_result(auto_handled_errors)
+                    wait_timeout = min(max(float(poll_interval_seconds or 0.5), 0.001), remaining) if poll_mode else remaining
+
+                triggered = self.error_handling_event.wait(timeout=wait_timeout)
+                if not triggered and not poll_mode and deadline is not None:
+                    logger.warning("[peptide] wait_for_error_handling 超时")
+                    return self._format_error_handling_timeout_result(auto_handled_errors)
+
+    @action(
+        always_free=True,
+        node_type=NodeType.MANUAL_CONFIRM,
+        placeholder_keys={"assignee_user_ids": "unilabos_manual_confirm"},
+        goal_default={
+            "reply_choice": "retry",
+            "error_message": "",
+            "timeout_seconds": 3600,
+            "assignee_user_ids": [],
+        },
+        feedback_interval=300,
+        description="现场确认调度异常的处理方式：重试当前步骤、跳过当前步骤或结束实验。",
+        handles=[
+            ActionInputHandle(key="token", data_type="str", label="错误标识", data_key="token", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="error_report", data_type="object", label="错误详情", data_key="error_report", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="error_message", data_type="text", label="错误说明", data_key="error_message", data_source=DataSource.HANDLE, io_type="source"),
+        ],
+    )
+    def reply_error_handling(
+        self,
+        token: str = "",
+        error_report: Optional[Dict[str, Any]] = None,
+        reply_choice: Literal["retry", "skip", "end_experiment"] = "retry",
+        error_message: str = "",
+        timeout_seconds: int = 3600,
+        assignee_user_ids: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """人工确认后向奔曜回复调度错误处理选择。
+
+        Args:
+            reply_choice[处理方式*]: 现场选择重试当前步骤、跳过当前步骤或结束实验。
+            error_message[错误说明]: 展示给确认人的错误说明，通常由上游等待节点传入。
+            timeout_seconds[等待超时时间]: 人工确认节点允许等待的最长秒数，默认 3600 秒。
+            assignee_user_ids[确认人]: 指定需要完成人工确认的用户；为空时由默认流程处理。
+            token[<token>*]: 上游等待节点传入的错误标识，通常无需手动填写。
+            error_report[<error_report>]: 上游等待节点传入的错误详情，通常无需手动填写。
+        """
+        del timeout_seconds, assignee_user_ids, kwargs
+        self._ensure_error_handling_state()
+        report_arg = dict(error_report) if isinstance(error_report, dict) and error_report else {}
+        report_token = self._error_handling_token_from_report(report_arg)
+        normalized_token = str(token or "").strip() or report_token
+        normalized_choice = str(reply_choice or "").strip()
+        if normalized_choice not in ERROR_HANDLING_CHOICE_TO_OPTION:
+            return {
+                "success": False,
+                "token": normalized_token,
+                "reply_status": "invalid_choice",
+                "reply_choice": normalized_choice,
+                "available_options": [dict(item) for item in ERROR_HANDLING_AVAILABLE_OPTIONS],
+                "message": f"未知错误处理选项: {normalized_choice}",
+            }
+
+        item: Optional[Dict[str, Any]] = None
+        if normalized_token and report_token and normalized_token != report_token:
+            return {
+                "success": False,
+                "token": normalized_token,
+                "reply_status": "token_mismatch",
+                "reply_choice": normalized_choice,
+                "message": f"输入 token 与 error_report.token 不一致: {normalized_token} != {report_token}",
+            }
+
+        if normalized_token:
+            item = self._claim_error_handling_item_by_token(normalized_token)
+            if not item:
+                if report_arg:
+                    report = report_arg
+                else:
+                    return {
+                        "success": False,
+                        "token": normalized_token,
+                        "reply_status": "missing_context",
+                        "reply_choice": normalized_choice,
+                        "message": "错误处理上下文不存在或已回复，请重新等待错误处理节点",
+                    }
+            else:
+                report = dict(item.get("error_report") or report_arg)
+                normalized_token = self._error_handling_token_from_item(item)
+        elif report_arg:
+            report = report_arg
+            normalized_token = report_token
+        else:
+            return {
+                "success": False,
+                "token": "",
+                "reply_status": "missing_error_report",
+                "reply_choice": normalized_choice,
+                "message": "缺少 token 时必须提供 error_report",
+            }
+
+        if normalized_token and not self._error_handling_token_from_report(report):
+            report["token"] = normalized_token
+        aggregated_message = str(error_message or "").strip() or self._error_handling_message(report)
+        option_int = ERROR_HANDLING_CHOICE_TO_OPTION[normalized_choice]
+
+        with self._debug_call_session("reply_error_handling"):
+            try:
+                result_code, reply_data = self._reply_scheduler_error_handling(report, option_int)
+            except Exception as exc:
+                if item is not None:
+                    item["status"] = "send_failed"
+                    item["reply_failure"] = str(exc)
+                    self._store_error_handling_in_flight(item, status="send_failed")
+                logger.error(
+                    "[peptide] 错误 %s 人工回复失败: choice=%s option=%s ijk=%s token=%s error=%s",
+                    normalized_token,
+                    normalized_choice,
+                    option_int,
+                    report.get("ijk"),
+                    report.get("token"),
+                    exc,
+                    exc_info=True,
+                )
+                return {
+                    "success": False,
+                    "token": normalized_token,
+                    "reply_status": "send_failed",
+                    "reply_choice": normalized_choice,
+                    "bioyond_option": option_int,
+                    "reply_result": 0,
+                    "error": str(exc),
+                    "confirmation_message": aggregated_message,
+                }
+
+            logger.info(
+                "[peptide] 错误 %s 人工回复: choice=%s option=%s ijk=%s token=%s result=%s",
+                normalized_token,
+                normalized_choice,
+                option_int,
+                report.get("ijk"),
+                report.get("token"),
+                result_code,
+            )
+        if result_code == 1:
+            if item is not None:
+                with self.error_handling_lock:
+                    self.error_in_flight.pop(normalized_token, None)
+                    self._refresh_error_handling_event_locked()
+            return {
+                "success": True,
+                "token": normalized_token,
+                "reply_status": "sent",
+                "reply_choice": normalized_choice,
+                "bioyond_option": option_int,
+                "reply_result": result_code,
+                "reply_data": reply_data,
+                "confirmation_message": aggregated_message,
+            }
+
+        if item is not None:
+            item["status"] = "send_failed"
+            item["reply_failure"] = f"scheduler_reply_error_handling 返回 {result_code}"
+            self._store_error_handling_in_flight(item, status="send_failed")
+            with self.error_handling_lock:
+                self._refresh_error_handling_event_locked()
+        logger.error(
+            "[peptide] 错误 %s 人工回复失败: choice=%s option=%s result=%s",
+            normalized_token,
+            normalized_choice,
+            option_int,
+            result_code,
+        )
+        return {
+            "success": False,
+            "token": normalized_token,
+            "reply_status": "send_failed",
+            "reply_choice": normalized_choice,
+            "bioyond_option": option_int,
+            "reply_result": result_code,
+            "reply_data": reply_data,
+            "confirmation_message": aggregated_message,
+        }
 
     def fetch_workflow_list(
         self,
