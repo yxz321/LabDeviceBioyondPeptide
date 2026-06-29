@@ -1412,12 +1412,12 @@ class BioyondWorkstation(WorkstationBase):
     def post_init(self, ros_node: ROS2WorkstationNode):
         self._ros_node = ros_node
 
-        # 启动连接监控
-        try:
-            self.connection_monitor = ConnectionMonitor(self)
-            self.connection_monitor.start()
-        except Exception as e:
-            logger.error(f"启动连接监控失败: {e}")
+        # 调试用连接监控会产生周期性的 ping/pong 心跳噪音，默认关闭。
+        # try:
+        #     self.connection_monitor = ConnectionMonitor(self)
+        #     self.connection_monitor.start()
+        # except Exception as e:
+        #     logger.error(f"启动连接监控失败: {e}")
 
         # 启动 HTTP 报送接收服务（现在 device_id 已可用）
         # ⚠️ 检查子类是否已经自己管理 HTTP 服务
