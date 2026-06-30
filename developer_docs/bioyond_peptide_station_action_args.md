@@ -61,6 +61,12 @@ goal defaults, handles, parameter classes, and docstring in the same order. If
 compatibility requires keeping an old signature order, the `Args:` block should
 still be sorted for users by importance.
 
+Input handle labels should carry the same required marker as the corresponding
+`Args:` or parameter-class display name. For example, an input handle that feeds
+`order_id[<order_id>*]` should use `label="<order_id>*"`. Output handle labels
+generally describe values produced by the node and do not automatically inherit
+the input required marker.
+
 ## Internally Resolved Parameters
 
 Parameters that are normally produced by another action or by internal runtime
@@ -203,6 +209,7 @@ Before finishing an action-argument cleanup:
 
 - Every exposed input argument has `name[显示名]` in `Args:`.
 - Required fields are marked with `*` in the display name.
+- Required input handle labels are also marked with `*`.
 - Internal resolved fields use `<variable_name>` display names.
 - Parameter order follows required/optional and human/internal importance.
 - Parameter-class inner fields use `Field(title=..., description=...)`, with

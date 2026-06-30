@@ -502,7 +502,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         goal_default={"publish_tree": True, "order_id": ""},
         description="按上游实验同步物料并发布资源树",
         handles=[
-            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>*", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
             ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
         ],
     )
@@ -893,7 +893,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         feedback_interval=300,
         description="现场确认调度异常的处理方式：重试当前步骤、跳过当前步骤或结束实验。",
         handles=[
-            ActionInputHandle(key="token", data_type="str", label="错误标识", data_key="token", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="token", data_type="str", label="错误标识*", data_key="token", data_source=DataSource.HANDLE, io_type="source"),
             ActionInputHandle(key="error_report", data_type="object", label="错误详情", data_key="error_report", data_source=DataSource.HANDLE, io_type="source"),
             ActionInputHandle(key="error_message", data_type="text", label="错误说明", data_key="error_message", data_source=DataSource.HANDLE, io_type="source"),
         ],
@@ -1468,7 +1468,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(
                 key="cem_method_file_name",
                 data_type="str",
-                label="CEM方法文件",
+                label="CEM方法文件*",
                 data_key="cem_method_file_name",
                 data_source=DataSource.HANDLE,
                 io_type="source",
@@ -1476,7 +1476,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(
                 key="sample_excel_relative_path",
                 data_type="bioyond_sample_file",
-                label="<sample_excel_relative_path>",
+                label="<sample_excel_relative_path>*",
                 data_key="sample_excel_relative_path",
                 data_source=DataSource.HANDLE,
                 io_type="source",
@@ -1696,7 +1696,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         feedback_interval=300,
         description="展示物料装载表后启动调度器",
         handles=[
-            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>*", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
             ActionInputHandle(key="order_ids", data_type="bioyond_order_ids", label="<order_ids>", data_key="order_ids", data_source=DataSource.HANDLE, io_type="source"),
             ActionInputHandle(key="resultTable", data_type="table", label="装载确认表", data_key="resultTable", data_source=DataSource.HANDLE, io_type="source"),
             ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
@@ -2131,7 +2131,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         goal_default={"order_id": ""},
         description="按上游实验查询实验台物料并构造下料指引表，作为 wait_for_order_finish 的备用节点",
         handles=[
-            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>*", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
             ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="materials_by_order_id", data_type="array", label="实验台物料", data_key="materials_by_order_id", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="resultTable", data_type="object", label="下料指引表", data_key="resultTable", data_source=DataSource.EXECUTOR, io_type="target"),
@@ -2172,7 +2172,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(
                 key="order_id",
                 data_type="bioyond_order_id",
-                label="<order_id>",
+                label="<order_id>*",
                 data_key="order_id",
                 data_source=DataSource.HANDLE,
                 io_type="source",
@@ -2572,7 +2572,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         goal_default={"order_id": "", "preintake_ids": [], "material_ids": []},
         description="按上游实验通知奔曜完成物料取出",
         handles=[
-            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>*", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
             ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
         ],
     )
@@ -2656,7 +2656,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         goal_default={"order_id": ""},
         description="按上游实验查询实验台物料",
         handles=[
-            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>*", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
             ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="materials", data_type="array", label="实验台物料", data_key="materials", data_source=DataSource.EXECUTOR),
         ],
@@ -2756,7 +2756,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         always_free=True,
         description="查询实验报告文件列表",
         handles=[
-            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>*", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
             ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="file_zip", data_type="str", label="报告 ZIP 文件", data_key="file_zip", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="files", data_type="array", label="报告文件列表", data_key="files", data_source=DataSource.EXECUTOR),

@@ -229,6 +229,41 @@ def _action_handle_labels(method_name: str) -> Dict[str, str]:
     return labels
 
 
+def _action_input_handle_labels(method_name: str) -> Dict[str, str]:
+    decorator = _action_decorator_ast(method_name)
+    handles_kw = next((kw for kw in decorator.keywords if kw.arg == "handles"), None)
+    if handles_kw is None or not isinstance(handles_kw.value, ast.List):
+        return {}
+    labels: Dict[str, str] = {}
+    for item in handles_kw.value.elts:
+        if not isinstance(item, ast.Call) or not isinstance(item.func, ast.Name):
+            continue
+        if item.func.id != "ActionInputHandle":
+            continue
+        values = {
+            kw.arg: ast.literal_eval(kw.value)
+            for kw in item.keywords
+            if kw.arg in {"key", "label"} and isinstance(kw.value, ast.Constant)
+        }
+        if "key" in values and "label" in values:
+            labels[str(values["key"])] = str(values["label"])
+    return labels
+
+
+def _docstring_arg_display_names(method_name: str) -> Dict[str, str]:
+    doc = ast.get_docstring(_station_method_ast(method_name)) or ""
+    display_names: Dict[str, str] = {}
+    for raw_line in doc.splitlines():
+        line = raw_line.strip()
+        if "[" not in line or "]:" not in line:
+            continue
+        name, rest = line.split("[", 1)
+        if not name.isidentifier():
+            continue
+        display_names[name] = rest.split("]:", 1)[0]
+    return display_names
+
+
 def _action_input_handle_keys(method_name: str) -> List[str]:
     decorator = _action_decorator_ast(method_name)
     handles_kw = next((kw for kw in decorator.keywords if kw.arg == "handles"), None)
@@ -307,6 +342,28 @@ def test_registry_surface_labels_follow_action_args_contract_ast() -> None:
     unload_doc = ast.get_docstring(_station_method_ast("unload_materials")) or ""
     assert "order_id[<order_id>*]" in unload_doc
     assert "resultTable[<resultTable>]" in unload_doc
+
+
+def test_required_input_handle_labels_mark_required_star_ast() -> None:
+    station_cls = _ast_class(CLASS_NAME)
+    for item in station_cls.body:
+        if not isinstance(item, ast.FunctionDef):
+            continue
+        if not any(
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Name)
+            and decorator.func.id == "action"
+            for decorator in item.decorator_list
+        ):
+            continue
+        input_labels = _action_input_handle_labels(item.name)
+        if not input_labels:
+            continue
+        arg_display_names = _docstring_arg_display_names(item.name)
+        for key, label in input_labels.items():
+            display_name = arg_display_names.get(key)
+            if display_name and display_name.endswith("*"):
+                assert label.endswith("*"), f"{item.name}.{key} input handle label should be required: {label!r}"
 
 
 def test_submit_param_field_metadata_uses_titles_and_user_facing_descriptions_ast() -> None:

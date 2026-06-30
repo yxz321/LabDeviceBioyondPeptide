@@ -393,7 +393,7 @@ def test_error_handling_nodes_are_ast_visible() -> None:
     assert reply_handles == {"token", "error_report", "error_message"}
     reply_labels = {handle["key"]: handle["label"] for handle in reply_args["handles"]}
     assert reply_labels == {
-        "token": "错误标识",
+        "token": "错误标识*",
         "error_report": "错误详情",
         "error_message": "错误说明",
     }
