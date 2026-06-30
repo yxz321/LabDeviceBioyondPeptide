@@ -445,6 +445,7 @@ def test_required_actions_exposed() -> None:
     cls = getattr(_import_module(), CLASS_NAME)
     required = {
         "upload_sample_excel",
+        "download_sample_excel_from_notebook",
         "list_sample_excels",
         "get_step_parameters",
         "submit_experiment",
@@ -472,6 +473,7 @@ def test_required_actions_exposed() -> None:
         "get_order_report",
         "get_aggregated_order_report",
         "get_order_report_files",
+        "attach_order_report_files_to_notebook",
         "display_values",
         "display_values_manual_confirm",
     }
@@ -495,11 +497,13 @@ def test_manual_confirm_node_types() -> None:
         "reset_auto",
         "scheduler_start",
         "list_sample_excels",
+        "download_sample_excel_from_notebook",
         "get_step_parameters",
         "sync_materials_from_bioyond",
         "get_order_list",
         "get_order_report",
         "get_order_report_files",
+        "attach_order_report_files_to_notebook",
         "display_values",
     }
     for name in manual:
@@ -1138,6 +1142,13 @@ def test_get_order_list_returns_order_handles_and_status_mapping() -> None:
     assert out["order_codes"] == ["EXP-001", "EXP-002"]
     assert out["order_code"] == "EXP-001"
     assert out["orders"][0]["order_name"] == "N1"
+    assert out["order_info"] == {}
+
+    out_latest = station.get_order_list(status="成功（80）", max_results=2, latest_only=True)
+    assert out_latest["items"] == [
+        {"id": "OID-1", "orderCode": "EXP-001", "name": "N1", "status": "80", "creationTime": "T1"}
+    ]
+    assert out_latest["order_info"] == out_latest["items"][0]
 
 
 def test_get_order_list_warns_without_order_code() -> None:
@@ -1261,30 +1272,304 @@ def test_direct_take_out_and_batch_cancel_metadata() -> None:
 
 def test_get_order_report_calls_typed_rpc() -> None:
     station = _make_station()
-    station.hardware_interface.order_report.return_value = {"id": ORDER_GUID, "name": "x", "preIntakes": [], "resultList": []}
+    raw = {"id": ORDER_GUID, "name": "x", "preIntakes": [], "resultList": []}
+    station.hardware_interface.order_report.return_value = raw
     out = station.get_order_report(ORDER_GUID)
     station.hardware_interface.order_report.assert_called_once_with(ORDER_GUID)
     assert out["success"] is True
+    assert out["order_info"] == raw
     assert out["summary"]["id"] == ORDER_GUID
+    cls = getattr(_import_module(), CLASS_NAME)
+    meta = getattr(cls.get_order_report, "_action_registry_meta", {})
+    assert meta.get("goal_default") == {"order_id": ""}
+    handle_keys = _action_handle_keys(meta)
+    assert {"order_id", "order_info"} <= set(handle_keys)
+    labels = [_action_handle_attr(handle, "label") for handle in _action_handle_items(meta)]
+    assert "<order_id>*" in labels
+    assert "<order_info>" in labels
+
+
+def test_coerce_order_info_prefers_explicit_order_info() -> None:
+    station = _make_station()
+    full_order_list_output = {
+        "raw": {"items": [{"id": "WRONG"}], "totalCount": 1},
+        "items": [{"id": "ALSO-WRONG"}],
+        "order_info": {"id": ORDER_GUID, "workflowName": "Day3"},
+    }
+    assert station._coerce_order_info(full_order_list_output) == {
+        "id": ORDER_GUID,
+        "workflowName": "Day3",
+    }
 
 
 def test_get_order_report_files_handles_and_returns_file_outputs() -> None:
     station = _make_station()
     station.hardware_interface.host = "http://test"
+    order_info = {"id": ORDER_GUID, "workflowName": "Day3"}
     station.hardware_interface.order_report_files.return_value = [
         "/report/a.csv",
         "/report/result.zip",
     ]
 
-    out = station.get_order_report_files(ORDER_GUID)
+    out = station.get_order_report_files(ORDER_GUID, order_info=order_info)
 
     station.hardware_interface.order_report_files.assert_called_once_with(ORDER_GUID)
+    assert out["order_info"] == order_info
     assert out["file_zip"] == "http://test/report/result.zip"
     assert out["files"] == ["http://test/report/a.csv", "http://test/report/result.zip"]
     cls = getattr(_import_module(), CLASS_NAME)
     meta = getattr(cls.get_order_report_files, "_action_registry_meta", {})
     handle_keys = _action_handle_keys(meta)
-    assert {"order_id", "file_zip", "files"} <= set(handle_keys)
+    assert {"order_id", "order_info", "file_zip", "files"} <= set(handle_keys)
+    labels = [_action_handle_attr(handle, "label") for handle in _action_handle_items(meta)]
+    assert "<order_id>*" in labels
+    assert "<order_info>" in labels
+
+
+def test_get_order_report_files_returns_latest_day_zip() -> None:
+    station = _make_station()
+    station.hardware_interface.host = "http://test"
+    station.hardware_interface.order_report_files.return_value = [
+        "/report/a.pdf",
+        "/report/Day1-result.zip",
+        "/report/Day3-result.zip",
+        "/report/Day2-result.zip",
+    ]
+
+    out = station.get_order_report_files(ORDER_GUID)
+
+    assert out["file_zip"] == "http://test/report/Day3-result.zip"
+    assert out["warnings"] == [
+        "skipped_non_latest_zip:http://test/report/Day1-result.zip",
+        "skipped_non_latest_zip:http://test/report/Day2-result.zip",
+    ]
+
+
+def test_get_order_report_files_waits_for_delayed_zip(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_module()
+    sleeps: List[int] = []
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    station = _make_station()
+    station.hardware_interface.host = "http://test"
+    station.hardware_interface.order_report_files.side_effect = [
+        ["/report/a.pdf"],
+        ["/report/a.pdf"],
+        ["/report/a.pdf", "/report/Day2-result.zip"],
+    ]
+
+    out = station.get_order_report_files(ORDER_GUID)
+
+    assert station.hardware_interface.order_report_files.call_count == 3
+    assert sleeps == [60, 60]
+    assert out["zip_retry_count"] == 2
+    assert out["file_zip"] == "http://test/report/Day2-result.zip"
+    assert out["files"] == [
+        "http://test/report/a.pdf",
+        "http://test/report/Day2-result.zip",
+    ]
+
+
+def test_get_order_report_files_logs_and_continues_without_zip(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_module()
+    sleeps: List[int] = []
+    errors: List[tuple[Any, ...]] = []
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(module.logger, "error", lambda *args, **kwargs: errors.append(args))
+    station = _make_station()
+    station.hardware_interface.host = "http://test"
+    station.hardware_interface.order_report_files.side_effect = [
+        ["/report/a.pdf"]
+        for _ in range(11)
+    ]
+
+    out = station.get_order_report_files(ORDER_GUID)
+
+    assert station.hardware_interface.order_report_files.call_count == 11
+    assert sleeps == [60] * 10
+    assert out["zip_retry_count"] == 10
+    assert out["file_zip"] == ""
+    assert out["files"] == ["http://test/report/a.pdf"]
+    assert out["warnings"] == ["report_zip_not_ready_after_retries"]
+    assert errors
+
+
+def test_download_sample_excel_from_notebook_downloads_file_node(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nbc = importlib.import_module("bioyond_peptide_station.notebook_client")
+    source = tmp_path / "sample.xlsx"
+    source.write_bytes(b"excel-bytes")
+    record = [
+        {"type": "p", "children": [{"text": "hello"}]},
+        {
+            "type": "file",
+            "name": "sample.xlsx",
+            "url": source.as_uri(),
+            "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "children": [{"text": ""}],
+        },
+    ]
+    fake_client = SimpleNamespace(
+        get_notebook_detail=lambda uuid: {"lab_record": record},
+        resolve_lab_record=lambda existing: existing,
+    )
+    monkeypatch.setattr(nbc, "default_client", lambda: fake_client)
+    station = _make_station()
+
+    out = station.download_sample_excel_from_notebook(
+        notebook_id="nb-1",
+        file_name_filter="sample.xlsx",
+        download_dir=str(tmp_path / "downloads"),
+    )
+
+    assert out["success"] is True
+    assert out["notebook_id"] == "nb-1"
+    assert out["file_name"] == "sample.xlsx"
+    assert out["sample_excel_pattern"] == "sample.xlsx"
+    assert Path(out["file_path"]).read_bytes() == b"excel-bytes"
+    cls = getattr(_import_module(), CLASS_NAME)
+    meta = getattr(cls.download_sample_excel_from_notebook, "_action_registry_meta", {})
+    assert meta.get("goal_default")["file_name_filter"] == "*.xlsx"
+    assert {"file_path", "content_type", "sample_excel_pattern", "notebook_id"} <= set(_action_handle_keys(meta))
+
+
+def test_attach_order_report_files_to_notebook_uploads_and_appends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nbc = importlib.import_module("bioyond_peptide_station.notebook_client")
+    pdf = tmp_path / "1-CEM.pdf"
+    day_pdf = tmp_path / "Day3-main.pdf"
+    day1_zip = tmp_path / "Day1-report.zip"
+    day2_zip = tmp_path / "Day2-report.zip"
+    day3_zip = tmp_path / "Day3-report.zip"
+    pdf.write_bytes(b"pdf")
+    day_pdf.write_bytes(b"day-pdf")
+    day1_zip.write_bytes(b"zip-1")
+    day2_zip.write_bytes(b"zip-2")
+    day3_zip.write_bytes(b"zip-3")
+
+    class FakeNotebookClient:
+        def __init__(self) -> None:
+            self.uploads: List[Dict[str, Any]] = []
+            self.blocks: List[Dict[str, Any]] = []
+
+        def upload_to_oss(self, file_path: str, scene: str = "image", content_type: str | None = None) -> Dict[str, Any]:
+            meta = {
+                "url": f"https://oss.example/{Path(file_path).name}",
+                "path": f"file/{Path(file_path).name}",
+                "name": Path(file_path).name,
+                "size": Path(file_path).stat().st_size,
+                "mimeType": content_type or "application/octet-stream",
+                "scene": scene,
+            }
+            self.uploads.append(meta)
+            return meta
+
+        def append_blocks_to_notebook(self, uuid: str, blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
+            assert uuid == "nb-1"
+            self.blocks = blocks
+            return {"appended": len(blocks), "total": len(blocks), "lab_record_url": "https://record.example/r.json"}
+
+    fake_client = FakeNotebookClient()
+    monkeypatch.setattr(nbc, "default_client", lambda: fake_client)
+    station = _make_station()
+    order_info = {
+        "workflowName": "Day3线肽环化",
+        "name": "实验260604-165635",
+        "id": ORDER_GUID,
+        "statusName": "Success",
+        "orderProgress": "admin created, started, ended",
+        "extraProperties": {
+            "SampleFile": "upload\\sample\\DPR019-test.xlsx",
+            "sampleCount": 4,
+            "sampleDetailCount": 64,
+        },
+    }
+
+    out = station.attach_order_report_files_to_notebook(
+        files=[
+            pdf.as_uri(),
+            day1_zip.as_uri(),
+            day_pdf.as_uri(),
+            "https://bioyond.example/report.csv",
+            day2_zip.as_uri(),
+        ],
+        file_zip=day3_zip.as_uri(),
+        notebook_id="nb-1",
+        order_id=ORDER_GUID,
+        order_info=order_info,
+        download_dir=str(tmp_path / "reports"),
+    )
+
+    assert out["success"] is True
+    assert out["file_count"] == 3
+    assert out["lab_record_url"] == "https://record.example/r.json"
+    assert [item["scene"] for item in fake_client.uploads] == ["file", "file", "file"]
+    assert [item["name"] for item in fake_client.uploads] == [
+        "1-CEM.pdf",
+        "Day3-main.pdf",
+        "Day3-report.zip",
+    ]
+    assert [block["type"] for block in fake_client.blocks] == ["p", "table", "file", "file", "file"]
+    table = fake_client.blocks[1]
+    assert table["children"][0]["children"][0]["children"][0]["children"][0]["text"] == "字段"
+    assert ["样品文件名", "SampleFile", "DPR019-test.xlsx"] in out["order_metadata_rows"]
+    assert ["样品数量", "sampleDetailCount", "64"] in out["order_metadata_rows"]
+    assert out["selected_files"] == [pdf.as_uri(), day_pdf.as_uri(), day3_zip.as_uri()]
+    assert out["warnings"] == [
+        "skipped_unsupported_file:https://bioyond.example/report.csv",
+        f"skipped_non_latest_zip:{day1_zip.as_uri()}",
+        f"skipped_non_latest_zip:{day2_zip.as_uri()}",
+    ]
+    cls = getattr(_import_module(), CLASS_NAME)
+    meta = getattr(cls.attach_order_report_files_to_notebook, "_action_registry_meta", {})
+    assert {"files", "file_zip", "order_id", "order_info", "notebook_id", "attached_files", "lab_record_url"} <= set(_action_handle_keys(meta))
+
+
+def test_select_report_file_urls_keeps_all_pdfs_and_one_zip() -> None:
+    station = _make_station()
+    selected, unsupported, skipped_zip = station._select_report_file_urls(
+        [
+            "http://bioyond/report/a.pdf",
+            "http://bioyond/report/Day1-result.zip",
+            "http://bioyond/report/b.PDF",
+            "http://bioyond/report/Day3-result.zip",
+            "http://bioyond/report/Day2-result.zip",
+            "http://bioyond/report/readme.txt",
+        ]
+    )
+
+    assert selected == [
+        "http://bioyond/report/a.pdf",
+        "http://bioyond/report/b.PDF",
+        "http://bioyond/report/Day3-result.zip",
+    ]
+    assert unsupported == ["http://bioyond/report/readme.txt"]
+    assert skipped_zip == [
+        "http://bioyond/report/Day1-result.zip",
+        "http://bioyond/report/Day2-result.zip",
+    ]
+
+
+def test_select_report_file_urls_prefers_explicit_non_day_zip() -> None:
+    station = _make_station()
+    selected, unsupported, skipped_zip = station._select_report_file_urls(
+        [
+            "http://bioyond/report/a.pdf",
+            "http://bioyond/report/result-a.zip",
+            "http://bioyond/report/result-b.zip",
+        ],
+        preferred_zip="http://bioyond/report/result-a.zip",
+    )
+
+    assert selected == [
+        "http://bioyond/report/a.pdf",
+        "http://bioyond/report/result-a.zip",
+    ]
+    assert unsupported == []
+    assert skipped_zip == ["http://bioyond/report/result-b.zip"]
 
 
 def test_display_values_returns_title_and_values() -> None:

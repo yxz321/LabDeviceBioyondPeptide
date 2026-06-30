@@ -6,15 +6,17 @@ import ast
 import copy
 import json
 import mimetypes
+import os
 import re
 import sys
+import tempfile
 import threading
 import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Dict, Iterable, List, Literal, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 from uuid import UUID
 
 import requests
@@ -555,6 +557,415 @@ class BioyondPeptideStation(BioyondWorkstation):
             return parent_debug_session(action_name)
         return nullcontext()
 
+    def _resolve_notebook_context(
+        self,
+        action_name: str,
+        notebook_id: str = "",
+        task_id: str = "",
+        job_id: str = "",
+    ) -> Dict[str, str]:
+        """Resolve notebook/task identity from the current Uni-Lab job context."""
+        explicit_notebook_id = str(notebook_id or "").strip()
+        explicit_task_id = str(task_id or "").strip()
+        explicit_job_id = str(job_id or "").strip()
+        if explicit_notebook_id:
+            return {
+                "notebook_id": explicit_notebook_id,
+                "task_id": explicit_task_id,
+                "job_id": explicit_job_id,
+                "device_action_key": "",
+                "source": "explicit",
+            }
+
+        try:
+            from unilabos.app.communication import get_communication_client
+
+            client = get_communication_client()
+            dm = getattr(client, "device_manager", None)
+            device_id = getattr(getattr(self, "_ros_node", None), "device_id", None)
+            if dm is None or not device_id:
+                logger.warning(
+                    "[peptide] 无法自动解析 notebook_id: device_manager=%s device_id=%s action=%s",
+                    bool(dm),
+                    device_id,
+                    action_name,
+                )
+                return {
+                    "notebook_id": "",
+                    "task_id": explicit_task_id,
+                    "job_id": explicit_job_id,
+                    "device_action_key": "",
+                    "source": "missing_context",
+                }
+
+            key = f"/devices/{device_id}/{action_name}"
+            candidates: List[Any] = []
+            seen: set[str] = set()
+
+            def _add_candidate(job: Any) -> None:
+                if job is None:
+                    return
+                if getattr(job, "device_action_key", key) != key:
+                    return
+                if explicit_task_id and getattr(job, "task_id", "") != explicit_task_id:
+                    return
+                if explicit_job_id and getattr(job, "job_id", "") != explicit_job_id:
+                    return
+                ident = str(getattr(job, "job_id", "") or id(job))
+                if ident in seen:
+                    return
+                seen.add(ident)
+                candidates.append(job)
+
+            active_jobs = getattr(dm, "active_jobs", {}) or {}
+            if hasattr(active_jobs, "get"):
+                _add_candidate(active_jobs.get(key))
+
+            try:
+                for job in dm.get_active_jobs():
+                    _add_candidate(job)
+            except Exception:
+                pass
+
+            if explicit_task_id or explicit_job_id:
+                for job in (getattr(dm, "all_jobs", {}) or {}).values():
+                    _add_candidate(job)
+
+            notebook_ids = {
+                str(getattr(job, "notebook_id", "") or "").strip()
+                for job in candidates
+                if str(getattr(job, "notebook_id", "") or "").strip()
+            }
+            if len(notebook_ids) > 1:
+                raise RuntimeError(
+                    f"无法唯一解析 notebook_id: action={action_name} task_id={explicit_task_id or '<auto>'} "
+                    f"candidates={sorted(notebook_ids)}"
+                )
+            if not notebook_ids:
+                return {
+                    "notebook_id": "",
+                    "task_id": explicit_task_id,
+                    "job_id": explicit_job_id,
+                    "device_action_key": key,
+                    "source": "not_found",
+                }
+
+            selected = next(
+                job
+                for job in candidates
+                if str(getattr(job, "notebook_id", "") or "").strip() in notebook_ids
+            )
+            return {
+                "notebook_id": next(iter(notebook_ids)),
+                "task_id": str(getattr(selected, "task_id", "") or explicit_task_id),
+                "job_id": str(getattr(selected, "job_id", "") or explicit_job_id),
+                "device_action_key": key,
+                "source": "device_manager",
+            }
+        except Exception as exc:
+            logger.warning("[peptide] 自动解析 notebook_id 失败 action=%s error=%s", action_name, exc)
+            raise
+
+    def _require_notebook_context(
+        self,
+        action_name: str,
+        notebook_id: str = "",
+        task_id: str = "",
+        job_id: str = "",
+    ) -> Dict[str, str]:
+        context = self._resolve_notebook_context(action_name, notebook_id, task_id, job_id)
+        if not context.get("notebook_id"):
+            raise RuntimeError(
+                f"{action_name} 未取得 notebook_id；请从 Notebook 运行该节点，或手动填写 notebook_id"
+            )
+        return context
+
+    @staticmethod
+    def _iter_notebook_nodes(value: Any) -> Iterable[Dict[str, Any]]:
+        if isinstance(value, dict):
+            yield value
+            for child in value.get("children") or []:
+                yield from BioyondPeptideStation._iter_notebook_nodes(child)
+        elif isinstance(value, list):
+            for item in value:
+                yield from BioyondPeptideStation._iter_notebook_nodes(item)
+
+    @staticmethod
+    def _file_name_from_url(url: str) -> str:
+        path = unquote(urlparse(str(url or "")).path)
+        return os.path.basename(path)
+
+    @classmethod
+    def _notebook_file_name(cls, node: Dict[str, Any]) -> str:
+        for key in ("name", "fileName", "filename"):
+            value = str(node.get(key) or "").strip()
+            if value:
+                return value
+        for key in ("path", "url"):
+            value = str(node.get(key) or "").strip()
+            if value:
+                name = cls._file_name_from_url(value)
+                if name:
+                    return name
+        return "notebook-file"
+
+    @classmethod
+    def _notebook_file_url(cls, node: Dict[str, Any]) -> str:
+        for key in ("url", "downloadUrl", "download_url", "path"):
+            value = str(node.get(key) or "").strip()
+            if value.startswith("http://") or value.startswith("https://") or value.startswith("file://"):
+                return value
+        return ""
+
+    @classmethod
+    def _find_notebook_file_nodes(
+        cls,
+        lab_record: Any,
+        *,
+        file_name_filter: str = "*",
+        extensions: Tuple[str, ...] = (),
+    ) -> List[Dict[str, Any]]:
+        pattern = str(file_name_filter or "*").strip() or "*"
+        normalized_exts = tuple(ext.lower() for ext in extensions)
+        matches: List[Dict[str, Any]] = []
+        for node in cls._iter_notebook_nodes(lab_record):
+            if str(node.get("type") or "") != "file":
+                continue
+            name = cls._notebook_file_name(node)
+            lower_name = name.lower()
+            if normalized_exts and not lower_name.endswith(normalized_exts):
+                continue
+            if not cls._filename_matches_pattern(name, pattern) and not cls._filename_matches_pattern(lower_name, pattern.lower()):
+                continue
+            payload = dict(node)
+            payload["_resolved_name"] = name
+            payload["_resolved_url"] = cls._notebook_file_url(node)
+            matches.append(payload)
+        return matches
+
+    @staticmethod
+    def _safe_download_filename(name: str, default_name: str) -> str:
+        candidate = os.path.basename(str(name or "").strip()) or default_name
+        candidate = re.sub(r"[^\w.()_-]+", "_", candidate, flags=re.UNICODE)
+        return candidate or default_name
+
+    @staticmethod
+    def _unique_path(path: Path) -> Path:
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        for idx in range(1, 1000):
+            candidate = path.with_name(f"{stem}-{idx}{suffix}")
+            if not candidate.exists():
+                return candidate
+        raise FileExistsError(f"无法生成唯一文件名: {path}")
+
+    def _download_url_to_local(
+        self,
+        url: str,
+        *,
+        download_dir: str = "",
+        filename: str = "",
+        default_name: str = "download.bin",
+    ) -> Dict[str, Any]:
+        source_url = str(url or "").strip()
+        if not source_url:
+            raise ValueError("缺少可下载文件 URL")
+        timeout = int(self.bioyond_config.get("timeout", 30) or 30)
+        target_dir = Path(download_dir).expanduser() if str(download_dir or "").strip() else Path(
+            tempfile.mkdtemp(prefix="peptide-notebook-")
+        )
+        target_dir.mkdir(parents=True, exist_ok=True)
+        parsed = urlparse(source_url)
+        resolved_name = filename or self._file_name_from_url(source_url) or default_name
+        safe_name = self._safe_download_filename(resolved_name, default_name)
+        target_path = self._unique_path(target_dir / safe_name)
+
+        if parsed.scheme == "file":
+            source_path = Path(unquote(parsed.path))
+            raw = source_path.read_bytes()
+            content_type = mimetypes.guess_type(source_path.name)[0] or "application/octet-stream"
+        elif parsed.scheme in {"http", "https"}:
+            resp = requests.get(source_url, timeout=timeout)
+            resp.raise_for_status()
+            raw = resp.content
+            content_type = (
+                resp.headers.get("Content-Type", "").split(";")[0].strip()
+                or mimetypes.guess_type(safe_name)[0]
+                or "application/octet-stream"
+            )
+        else:
+            source_path = Path(source_url).expanduser()
+            raw = source_path.read_bytes()
+            content_type = mimetypes.guess_type(source_path.name)[0] or "application/octet-stream"
+
+        target_path.write_bytes(raw)
+        return {
+            "file_path": str(target_path),
+            "file_name": target_path.name,
+            "source_url": source_url,
+            "size": len(raw),
+            "content_type": content_type,
+        }
+
+    @staticmethod
+    def _normalize_url_list(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item or "").strip()]
+            if any(sep in text for sep in ("\n", ";", ",")):
+                return [item.strip() for item in re.split(r"[\n;,]+", text) if item.strip()]
+            return [text]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item or "").strip()]
+        return [str(value).strip()]
+
+    @classmethod
+    def _coerce_order_info(cls, value: Any) -> Dict[str, Any]:
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            try:
+                return cls._coerce_order_info(json.loads(text))
+            except ValueError:
+                return {}
+        if isinstance(value, list):
+            for item in value:
+                resolved = cls._coerce_order_info(item)
+                if resolved:
+                    return resolved
+            return {}
+        if not isinstance(value, dict):
+            return {}
+
+        explicit_order_info = value.get("order_info")
+        if explicit_order_info is not None:
+            resolved = cls._coerce_order_info(explicit_order_info)
+            if resolved:
+                return resolved
+        raw = value.get("raw")
+        if isinstance(raw, dict):
+            return dict(raw)
+        orders = value.get("orders")
+        if isinstance(orders, list):
+            for order in orders:
+                resolved = cls._coerce_order_info(order)
+                if resolved:
+                    return resolved
+        items = value.get("items")
+        if isinstance(items, list):
+            for item in items:
+                resolved = cls._coerce_order_info(item)
+                if resolved:
+                    return resolved
+        return dict(value)
+
+    @staticmethod
+    def _path_basename(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        path = unquote(urlparse(text).path) if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text) else text
+        return re.split(r"[\\/]+", path.rstrip("\\/"))[-1]
+
+    @classmethod
+    def _order_metadata_rows(cls, order_info: Any, order_id: str = "") -> List[List[str]]:
+        info = cls._coerce_order_info(order_info)
+        extra = info.get("extraProperties") if isinstance(info.get("extraProperties"), dict) else {}
+        pre_extra: Dict[str, Any] = {}
+        for pre in info.get("preIntakes") or []:
+            if isinstance(pre, dict) and isinstance(pre.get("extraProperties"), dict):
+                pre_extra = pre["extraProperties"]
+                break
+
+        def _value(*keys: str, source: Optional[Dict[str, Any]] = None) -> str:
+            mapping = source or info
+            for key in keys:
+                val = mapping.get(key) if isinstance(mapping, dict) else None
+                if val is not None and str(val).strip() != "":
+                    return str(val)
+            return ""
+
+        sample_file = _value("SampleFile", source=extra) or _value("SampleFile", source=pre_extra)
+        rows = [
+            ["实验流程", "workflowName", _value("workflowName", "workFlowName")],
+            ["实验名", "name", _value("name", "orderName")],
+            ["实验" + "ID", "id", _value("id") or str(order_id or "").strip()],
+            ["实验状态", "statusName", _value("statusName") or _value("status")],
+            ["实验进程", "orderProgress", _value("orderProgress")],
+            ["样品文件名", "SampleFile", cls._path_basename(sample_file)],
+            ["样品板数量", "sampleCount", _value("sampleCount", source=extra)],
+            ["样品数量", "sampleDetailCount", _value("sampleDetailCount", source=extra)],
+        ]
+        return rows
+
+    @staticmethod
+    def _url_path_lower(url: str) -> str:
+        return str(url or "").split("?", 1)[0].lower()
+
+    @classmethod
+    def _day_number_from_report_url(cls, url: str) -> Optional[int]:
+        name = cls._path_basename(str(url or "").split("?", 1)[0])
+        match = re.search(r"\bday\s*(\d+)\b", name, flags=re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+    @classmethod
+    def _select_report_file_urls(
+        cls,
+        urls: List[str],
+        *,
+        preferred_zip: str = "",
+    ) -> Tuple[List[str], List[str], List[str]]:
+        deduped = list(dict.fromkeys(str(url or "").strip() for url in urls if str(url or "").strip()))
+        pdf_urls = [url for url in deduped if cls._url_path_lower(url).endswith(".pdf")]
+        zip_urls = [url for url in deduped if cls._url_path_lower(url).endswith(".zip")]
+        unsupported_urls = [
+            url for url in deduped
+            if not cls._url_path_lower(url).endswith((".pdf", ".zip"))
+        ]
+
+        selected_zip = ""
+        day_zip_pairs = [
+            (day, url)
+            for url in zip_urls
+            for day in [cls._day_number_from_report_url(url)]
+            if day is not None
+        ]
+        if day_zip_pairs:
+            latest_day = max(day for day, _ in day_zip_pairs)
+            selected_zip = [url for day, url in day_zip_pairs if day == latest_day][-1]
+        elif zip_urls:
+            normalized_preferred = str(preferred_zip or "").strip()
+            selected_zip = normalized_preferred if normalized_preferred in zip_urls else zip_urls[-1]
+
+        selected_urls = [
+            url for url in deduped
+            if url in pdf_urls or (selected_zip and url == selected_zip)
+        ]
+        skipped_zip_urls = [
+            url for url in zip_urls
+            if url != selected_zip
+        ]
+        return selected_urls, unsupported_urls, skipped_zip_urls
+
+    @classmethod
+    def _report_zip_urls(cls, urls: List[str]) -> List[str]:
+        return [
+            url for url in urls
+            if cls._url_path_lower(url).endswith(".zip")
+        ]
+
     def handle_external_error(self, error_data: Dict[str, Any]) -> Dict[str, Any]:
         """处理奔曜错误报送，并排队等待人工选择回复。"""
         parent_handler = getattr(super(), "handle_external_error", None)
@@ -1067,7 +1478,150 @@ class BioyondPeptideStation(BioyondWorkstation):
         items = self._as_list(data.get("items") if isinstance(data, dict) else data)
         return {"items": items, "totalCount": data.get("totalCount") if isinstance(data, dict) else len(items), "raw": data}
 
-    @action(auto_prefix=True, description="上传多肽样品 Excel 文件")
+    @action(
+        goal_default={
+            "notebook_id": "",
+            "task_id": "",
+            "file_name_filter": "*.xlsx",
+            "download_dir": "",
+        },
+        description="从 Notebook 下载多肽样品 Excel 文件",
+        handles=[
+            ActionOutputHandle(
+                key="file_path",
+                data_type="str",
+                label="<file_path>",
+                data_key="file_path",
+                data_source=DataSource.EXECUTOR,
+            ),
+            ActionOutputHandle(
+                key="content_type",
+                data_type="str",
+                label="文件类型",
+                data_key="content_type",
+                data_source=DataSource.EXECUTOR,
+            ),
+            ActionOutputHandle(
+                key="sample_excel_pattern",
+                data_type="str",
+                label="样品excel名称",
+                data_key="sample_excel_pattern",
+                data_source=DataSource.EXECUTOR,
+            ),
+            ActionOutputHandle(
+                key="notebook_id",
+                data_type="str",
+                label="<notebook_id>",
+                data_key="notebook_id",
+                data_source=DataSource.EXECUTOR,
+            ),
+            ActionOutputHandle(
+                key="notebook_excel_file",
+                data_type="json",
+                label="Notebook 样品 Excel",
+                data_key="notebook_excel_file",
+                data_source=DataSource.EXECUTOR,
+            ),
+        ],
+    )
+    def download_sample_excel_from_notebook(
+        self,
+        notebook_id: str = "",
+        task_id: str = "",
+        file_name_filter: str = "*.xlsx",
+        download_dir: str = "",
+    ) -> Dict[str, Any]:
+        """从当前实验记录下载样品 Excel 文件。
+
+        Args:
+            notebook_id[<notebook_id>]: 当前实验记录的 Notebook ID；未填写时从运行上下文自动获取。
+            task_id[<task_id>]: 当前工作流任务 ID；通常由系统自动提供，手动测试时可填写。
+            file_name_filter[样品excel筛选关键字]: 按文件名筛选 Notebook 中的 Excel 附件。
+            download_dir[下载目录]: 保存下载文件的本地目录；未填写时使用临时目录。
+        """
+        context = self._require_notebook_context(
+            "download_sample_excel_from_notebook",
+            notebook_id=notebook_id,
+            task_id=task_id,
+        )
+        from bioyond_peptide_station import notebook_client as nbc
+
+        client = nbc.default_client()
+        detail = client.get_notebook_detail(context["notebook_id"])
+        lab_record = client.resolve_lab_record(detail.get("lab_record"))
+        matches = self._find_notebook_file_nodes(
+            lab_record,
+            file_name_filter=file_name_filter,
+            extensions=(".xlsx",),
+        )
+        if not matches:
+            raise FileNotFoundError(
+                f"Notebook 中未找到匹配 {file_name_filter!r} 的 .xlsx 附件: {context['notebook_id']}"
+            )
+        if len(matches) > 1:
+            names = ", ".join(self._notebook_file_name(item) for item in matches)
+            raise RuntimeError(f"Notebook 中匹配到多个样品 Excel，请缩小筛选条件: {names}")
+
+        selected = matches[0]
+        source_url = str(selected.get("_resolved_url") or "")
+        if not source_url:
+            raise RuntimeError(f"Notebook 样品 Excel 缺少可下载 URL: {self._notebook_file_name(selected)}")
+        downloaded = self._download_url_to_local(
+            source_url,
+            download_dir=download_dir,
+            filename=self._notebook_file_name(selected),
+            default_name="sample.xlsx",
+        )
+        return {
+            "success": True,
+            "notebook_id": context["notebook_id"],
+            "task_id": context.get("task_id", ""),
+            "job_id": context.get("job_id", ""),
+            "context_source": context.get("source", ""),
+            "file_path": downloaded["file_path"],
+            "file_name": downloaded["file_name"],
+            "sample_excel_pattern": downloaded["file_name"],
+            "content_type": downloaded["content_type"],
+            "downloaded_file": downloaded,
+            "notebook_excel_file": selected,
+        }
+
+    @action(
+        auto_prefix=True,
+        description="上传多肽样品 Excel 文件",
+        handles=[
+            ActionInputHandle(
+                key="file_path",
+                data_type="str",
+                label="<file_path>",
+                data_key="file_path",
+                data_source=DataSource.HANDLE,
+                io_type="source",
+            ),
+            ActionInputHandle(
+                key="content_type",
+                data_type="str",
+                label="文件类型",
+                data_key="content_type",
+                data_source=DataSource.HANDLE,
+                io_type="source",
+            ),
+            ActionOutputHandle(
+                key="relative_path",
+                data_type="str",
+                label="<relative_path>",
+                data_key="relative_path",
+                data_source=DataSource.EXECUTOR,
+            ),
+            ActionOutputHandle(
+                key="sample_file_parameter",
+                data_type="bioyond_sample_file",
+                label="<sample_file_parameter>",
+                data_key="sample_file_parameter",
+                data_source=DataSource.EXECUTOR,
+            ),
+        ],
+    )
     def upload_sample_excel(self, file_path: str, content_type: Optional[str] = None) -> Dict[str, Any]:
         """上传本地样品表到奔曜。
 
@@ -1103,6 +1657,14 @@ class BioyondPeptideStation(BioyondWorkstation):
                 label="样品 Excel 列表",
                 data_key="sample_excel_data",
                 data_source=DataSource.EXECUTOR,
+            ),
+            ActionInputHandle(
+                key="name_filter",
+                data_type="str",
+                label="样品excel筛选关键字",
+                data_key="name_filter",
+                data_source=DataSource.HANDLE,
+                io_type="source",
             ),
         ],
     )
@@ -2479,6 +3041,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionOutputHandle(key="order_ids", data_type="bioyond_order_ids", label="<order_ids>", data_key="order_ids", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="order_code", data_type="bioyond_order_code", label="实验编号", data_key="order_code", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="order_codes", data_type="bioyond_order_codes", label="实验编号列表", data_key="order_codes", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="order_info", data_type="json", label="<order_info>", data_key="order_info", data_source=DataSource.EXECUTOR),
         ],
     )
     def get_order_list(
@@ -2564,6 +3127,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             "order_id": order_ids[0] if order_ids else "",
             "order_codes": order_codes,
             "order_code": order_codes[0] if order_codes else "",
+            "order_info": orders[0]["raw"] if latest_only and orders else {},
             "warnings": warnings,
         }
 
@@ -2718,7 +3282,16 @@ class BioyondPeptideStation(BioyondWorkstation):
             "message": "批量取消成功" if code == 1 else "批量取消失败",
         }
 
-    @action(always_free=True, description="查询单个实验报告")
+    @action(
+        always_free=True,
+        goal_default={"order_id": ""},
+        description="查询单个实验报告",
+        handles=[
+            ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>*", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
+            ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="order_info", data_type="json", label="<order_info>", data_key="order_info", data_source=DataSource.EXECUTOR),
+        ],
+    )
     def get_order_report(self, order_id: str) -> Dict[str, Any]:
         """查询单个实验报告。
 
@@ -2728,7 +3301,14 @@ class BioyondPeptideStation(BioyondWorkstation):
         resolved = self._require_uuid(order_id, "order_id")
         with self._debug_call_session("get_order_report"):
             raw = self._require_hardware_interface().order_report(resolved)
-        return {"success": True, "order_id": resolved, "raw": raw, "summary": self._normalize_order_report(raw)}
+        order_info = raw if isinstance(raw, dict) else {}
+        return {
+            "success": True,
+            "order_id": resolved,
+            "raw": raw,
+            "order_info": order_info,
+            "summary": self._normalize_order_report(raw),
+        }
 
     @action(always_free=True, description="聚合实验报告（占位）")
     def get_aggregated_order_report(self, order_id: str) -> Dict[str, Any]:
@@ -2754,29 +3334,239 @@ class BioyondPeptideStation(BioyondWorkstation):
 
     @action(
         always_free=True,
+        goal_default={"order_id": "", "order_info": {}},
         description="查询实验报告文件列表",
         handles=[
             ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>*", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="order_info", data_type="json", label="<order_info>", data_key="order_info", data_source=DataSource.HANDLE, io_type="source"),
             ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="order_info", data_type="json", label="<order_info>", data_key="order_info", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="file_zip", data_type="str", label="报告 ZIP 文件", data_key="file_zip", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="files", data_type="array", label="报告文件列表", data_key="files", data_source=DataSource.EXECUTOR),
         ],
     )
-    def get_order_report_files(self, order_id: str) -> Dict[str, Any]:
+    def get_order_report_files(self, order_id: str, order_info: Any = None) -> Dict[str, Any]:
         """查询实验报告文件列表。
 
         Args:
             order_id[<order_id>*]: 奔曜内部标识，通常由上游节点传入。
+            order_info[<order_info>]: 上游实验列表节点返回的实验信息，通常自动传入。
         """
         resolved = self._require_uuid(order_id, "order_id")
         rpc = self._require_hardware_interface()
-        with self._debug_call_session("get_order_report_files"):
-            files = rpc.order_report_files(resolved)
         api_host = str(getattr(rpc, "host", "") or self.bioyond_config.get("api_host", "")).rstrip("/")
-        file_urls = [self._join_api_url(api_host, path) for path in files]
-        zip_urls = [url for url in file_urls if url.lower().endswith(".zip")]
-        file_zip = zip_urls[-1] if zip_urls else ""
-        return {"success": True, "order_id": resolved, "file_zip": file_zip, "files": file_urls, "file_count": len(file_urls)}
+        zip_retry_attempts = 10
+        zip_retry_wait_seconds = 60
+        warnings: List[str] = []
+
+        def _fetch_report_file_urls() -> List[str]:
+            with self._debug_call_session("get_order_report_files"):
+                raw_files = rpc.order_report_files(resolved)
+            return [self._join_api_url(api_host, path) for path in self._as_list(raw_files)]
+
+        file_urls = _fetch_report_file_urls()
+        zip_urls = self._report_zip_urls(file_urls)
+        retry_count = 0
+        while not zip_urls and retry_count < zip_retry_attempts:
+            retry_count += 1
+            logger.warning(
+                "[peptide] Bioyond 报告 ZIP 尚未生成，等待后重试: order_id=%s retry=%s/%s wait_seconds=%s",
+                resolved,
+                retry_count,
+                zip_retry_attempts,
+                zip_retry_wait_seconds,
+            )
+            time.sleep(zip_retry_wait_seconds)
+            file_urls = _fetch_report_file_urls()
+            zip_urls = self._report_zip_urls(file_urls)
+
+        if not zip_urls:
+            logger.error(
+                "[peptide] Bioyond 报告 ZIP 等待超时，继续使用已返回文件写入 Notebook: "
+                "order_id=%s retries=%s files=%s",
+                resolved,
+                zip_retry_attempts,
+                file_urls,
+            )
+            warnings.append("report_zip_not_ready_after_retries")
+        selected_report_urls, _, skipped_zip_urls = self._select_report_file_urls(file_urls)
+        selected_zip_urls = self._report_zip_urls(selected_report_urls)
+        file_zip = selected_zip_urls[-1] if selected_zip_urls else ""
+        return {
+            "success": True,
+            "order_id": resolved,
+            "order_info": self._coerce_order_info(order_info),
+            "file_zip": file_zip,
+            "files": file_urls,
+            "file_count": len(file_urls),
+            "zip_retry_count": retry_count,
+            "zip_wait_seconds": zip_retry_wait_seconds,
+            "warnings": warnings + [
+                f"skipped_non_latest_zip:{url}"
+                for url in skipped_zip_urls
+            ],
+        }
+
+    @action(
+        goal_default={
+            "files": [],
+            "file_zip": "",
+            "notebook_id": "",
+            "task_id": "",
+            "order_id": "",
+            "order_info": {},
+            "download_dir": "",
+        },
+        description="将奔曜实验报告文件写入 Notebook",
+        handles=[
+            ActionInputHandle(
+                key="files",
+                data_type="array",
+                label="报告文件列表",
+                data_key="files",
+                data_source=DataSource.HANDLE,
+                io_type="source",
+            ),
+            ActionInputHandle(
+                key="file_zip",
+                data_type="str",
+                label="报告 ZIP 文件",
+                data_key="file_zip",
+                data_source=DataSource.HANDLE,
+                io_type="source",
+            ),
+            ActionInputHandle(
+                key="order_id",
+                data_type="bioyond_order_id",
+                label="<order_id>",
+                data_key="order_id",
+                data_source=DataSource.HANDLE,
+                io_type="source",
+            ),
+            ActionInputHandle(
+                key="order_info",
+                data_type="json",
+                label="<order_info>",
+                data_key="order_info",
+                data_source=DataSource.HANDLE,
+                io_type="source",
+            ),
+            ActionOutputHandle(
+                key="notebook_id",
+                data_type="str",
+                label="<notebook_id>",
+                data_key="notebook_id",
+                data_source=DataSource.EXECUTOR,
+            ),
+            ActionOutputHandle(
+                key="attached_files",
+                data_type="array",
+                label="已写入报告文件",
+                data_key="attached_files",
+                data_source=DataSource.EXECUTOR,
+            ),
+            ActionOutputHandle(
+                key="lab_record_url",
+                data_type="str",
+                label="Notebook 记录地址",
+                data_key="lab_record_url",
+                data_source=DataSource.EXECUTOR,
+            ),
+        ],
+    )
+    def attach_order_report_files_to_notebook(
+        self,
+        files: Any = None,
+        file_zip: str = "",
+        notebook_id: str = "",
+        task_id: str = "",
+        order_id: str = "",
+        order_info: Any = None,
+        download_dir: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """将奔曜实验报告文件上传并写入当前实验记录。
+
+        Args:
+            files[报告文件列表]: 上游查询到的报告文件地址列表。
+            file_zip[报告 ZIP 文件]: 上游查询到的报告 ZIP 文件地址。
+            order_id[<order_id>]: 奔曜内部标识，通常由上游节点传入。
+            order_info[<order_info>]: 上游实验列表节点返回的实验信息，通常自动传入。
+            notebook_id[<notebook_id>]: 当前实验记录的 Notebook ID；未填写时从运行上下文自动获取。
+            task_id[<task_id>]: 当前工作流任务 ID；通常由系统自动提供，手动测试时可填写。
+            download_dir[下载目录]: 保存下载文件的本地目录；未填写时使用临时目录。
+        """
+        del kwargs
+        context = self._require_notebook_context(
+            "attach_order_report_files_to_notebook",
+            notebook_id=notebook_id,
+            task_id=task_id,
+        )
+        urls = self._normalize_url_list(files)
+        zip_url = str(file_zip or "").strip()
+        if zip_url and zip_url not in urls:
+            urls.append(zip_url)
+        urls = list(dict.fromkeys(urls))
+        supported_urls, skipped_urls, skipped_zip_urls = self._select_report_file_urls(
+            urls,
+            preferred_zip=zip_url,
+        )
+        if not supported_urls:
+            raise FileNotFoundError("未找到可写入 Notebook 的 PDF 或 ZIP 报告文件")
+
+        from bioyond_peptide_station import notebook_client as nbc
+
+        client = nbc.default_client()
+        attached_files: List[Dict[str, Any]] = []
+        downloaded_files: List[Dict[str, Any]] = []
+        metadata_rows = self._order_metadata_rows(order_info, order_id=order_id)
+        blocks: List[Dict[str, Any]] = [
+            nbc.text_block(
+                f"奔曜实验报告文件已生成"
+                f"{f'（order_id={str(order_id).strip()}）' if str(order_id or '').strip() else ''}。"
+            ),
+            nbc.build_table_node(["字段", "Field", "值 / Value"], metadata_rows, col_sizes=[140, 160, 360]),
+        ]
+        for index, url in enumerate(supported_urls, start=1):
+            downloaded = self._download_url_to_local(
+                url,
+                download_dir=download_dir,
+                default_name=f"bioyond-report-{index}",
+            )
+            downloaded_files.append(downloaded)
+            meta = client.upload_to_oss(
+                downloaded["file_path"],
+                scene="file",
+                content_type=downloaded.get("content_type") or None,
+            )
+            attached_files.append(meta)
+            blocks.append(nbc.build_file_node(meta))
+
+        append_result = client.append_blocks_to_notebook(context["notebook_id"], blocks)
+        return {
+            "success": True,
+            "notebook_id": context["notebook_id"],
+            "task_id": context.get("task_id", ""),
+            "job_id": context.get("job_id", ""),
+            "context_source": context.get("source", ""),
+            "order_id": str(order_id or "").strip(),
+            "order_info": self._coerce_order_info(order_info),
+            "order_metadata_rows": metadata_rows,
+            "files": urls,
+            "selected_files": supported_urls,
+            "downloaded_files": downloaded_files,
+            "attached_files": attached_files,
+            "file_count": len(attached_files),
+            "append_result": append_result,
+            "lab_record_url": append_result.get("lab_record_url", ""),
+            "warnings": [
+                f"skipped_unsupported_file:{url}"
+                for url in skipped_urls
+            ] + [
+                f"skipped_non_latest_zip:{url}"
+                for url in skipped_zip_urls
+            ],
+        }
 
     @action(
         always_free=True,
