@@ -1593,7 +1593,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(
                 key="file_path",
                 data_type="str",
-                label="<file_path>",
+                label="<file_path>*",
                 data_key="file_path",
                 data_source=DataSource.HANDLE,
                 io_type="source",
