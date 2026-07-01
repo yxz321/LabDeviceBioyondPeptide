@@ -1441,11 +1441,13 @@ def test_attach_order_report_files_to_notebook_uploads_and_appends(
     nbc = importlib.import_module("bioyond_peptide_station.notebook_client")
     pdf = tmp_path / "1-CEM.pdf"
     day_pdf = tmp_path / "Day3-main.pdf"
+    xlsx = tmp_path / "Day3-summary.xlsx"
     day1_zip = tmp_path / "Day1-report.zip"
     day2_zip = tmp_path / "Day2-report.zip"
     day3_zip = tmp_path / "Day3-report.zip"
     pdf.write_bytes(b"pdf")
     day_pdf.write_bytes(b"day-pdf")
+    xlsx.write_bytes(b"xlsx")
     day1_zip.write_bytes(b"zip-1")
     day2_zip.write_bytes(b"zip-2")
     day3_zip.write_bytes(b"zip-3")
@@ -1493,6 +1495,7 @@ def test_attach_order_report_files_to_notebook_uploads_and_appends(
             pdf.as_uri(),
             day1_zip.as_uri(),
             day_pdf.as_uri(),
+            xlsx.as_uri(),
             "https://bioyond.example/report.csv",
             day2_zip.as_uri(),
         ],
@@ -1504,20 +1507,23 @@ def test_attach_order_report_files_to_notebook_uploads_and_appends(
     )
 
     assert out["success"] is True
-    assert out["file_count"] == 3
+    assert out["file_count"] == 4
     assert out["lab_record_url"] == "https://record.example/r.json"
-    assert [item["scene"] for item in fake_client.uploads] == ["file", "file", "file"]
+    assert [item["scene"] for item in fake_client.uploads] == ["file", "file", "file", "file"]
     assert [item["name"] for item in fake_client.uploads] == [
+        "Day3-summary.xlsx",
         "1-CEM.pdf",
         "Day3-main.pdf",
         "Day3-report.zip",
     ]
-    assert [block["type"] for block in fake_client.blocks] == ["p", "table", "file", "file", "file"]
+    assert [block["type"] for block in fake_client.blocks] == ["p", "table", "p", "file", "file", "file", "file"]
     table = fake_client.blocks[1]
     assert table["children"][0]["children"][0]["children"][0]["children"][0]["text"] == "字段"
+    assert fake_client.blocks[2]["children"][0]["text"] == "附件：*.xlsx, *.pdf, *.zip"
     assert ["样品文件名", "SampleFile", "DPR019-test.xlsx"] in out["order_metadata_rows"]
     assert ["样品数量", "sampleDetailCount", "64"] in out["order_metadata_rows"]
-    assert out["selected_files"] == [pdf.as_uri(), day_pdf.as_uri(), day3_zip.as_uri()]
+    assert out["selected_attachment_patterns"] == ["*.xlsx", "*.pdf", "*.zip"]
+    assert out["selected_files"] == [xlsx.as_uri(), pdf.as_uri(), day_pdf.as_uri(), day3_zip.as_uri()]
     assert out["warnings"] == [
         "skipped_unsupported_file:https://bioyond.example/report.csv",
         f"skipped_non_latest_zip:{day1_zip.as_uri()}",
@@ -1525,16 +1531,76 @@ def test_attach_order_report_files_to_notebook_uploads_and_appends(
     ]
     cls = getattr(_import_module(), CLASS_NAME)
     meta = getattr(cls.attach_order_report_files_to_notebook, "_action_registry_meta", {})
+    assert meta.get("goal_default")["include_xlsx"] is True
+    assert meta.get("goal_default")["include_pdf"] is True
+    assert meta.get("goal_default")["include_zip"] is True
     assert {"files", "file_zip", "order_id", "order_info", "notebook_id", "attached_files", "lab_record_url"} <= set(_action_handle_keys(meta))
 
 
-def test_select_report_file_urls_keeps_all_pdfs_and_one_zip() -> None:
+def test_attach_order_report_files_to_notebook_respects_disabled_types(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nbc = importlib.import_module("bioyond_peptide_station.notebook_client")
+    pdf = tmp_path / "1-CEM.pdf"
+    xlsx = tmp_path / "Day3-summary.xlsx"
+    zip_file = tmp_path / "Day3-report.zip"
+    pdf.write_bytes(b"pdf")
+    xlsx.write_bytes(b"xlsx")
+    zip_file.write_bytes(b"zip")
+
+    class FakeNotebookClient:
+        def __init__(self) -> None:
+            self.uploads: List[Dict[str, Any]] = []
+            self.blocks: List[Dict[str, Any]] = []
+
+        def upload_to_oss(self, file_path: str, scene: str = "image", content_type: str | None = None) -> Dict[str, Any]:
+            meta = {
+                "url": f"https://oss.example/{Path(file_path).name}",
+                "path": f"file/{Path(file_path).name}",
+                "name": Path(file_path).name,
+                "size": Path(file_path).stat().st_size,
+                "mimeType": content_type or "application/octet-stream",
+                "scene": scene,
+            }
+            self.uploads.append(meta)
+            return meta
+
+        def append_blocks_to_notebook(self, uuid: str, blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
+            assert uuid == "nb-1"
+            self.blocks = blocks
+            return {"appended": len(blocks), "total": len(blocks), "lab_record_url": "https://record.example/r.json"}
+
+    fake_client = FakeNotebookClient()
+    monkeypatch.setattr(nbc, "default_client", lambda: fake_client)
+    station = _make_station()
+
+    out = station.attach_order_report_files_to_notebook(
+        files=[pdf.as_uri(), xlsx.as_uri(), zip_file.as_uri()],
+        notebook_id="nb-1",
+        include_xlsx=False,
+        include_pdf=False,
+        include_zip=False,
+        download_dir=str(tmp_path / "reports"),
+    )
+
+    assert out["success"] is True
+    assert out["file_count"] == 0
+    assert out["selected_files"] == []
+    assert out["selected_attachment_patterns"] == []
+    assert fake_client.uploads == []
+    assert [block["type"] for block in fake_client.blocks] == ["p", "table", "p"]
+    assert fake_client.blocks[2]["children"][0]["text"] == "附件：无，未勾选插入附件"
+
+
+def test_select_report_file_urls_keeps_all_pdfs_and_one_zip_in_excel_pdf_zip_order() -> None:
     station = _make_station()
     selected, unsupported, skipped_zip = station._select_report_file_urls(
         [
             "http://bioyond/report/a.pdf",
             "http://bioyond/report/Day1-result.zip",
             "http://bioyond/report/b.PDF",
+            "http://bioyond/report/summary.xlsx",
             "http://bioyond/report/Day3-result.zip",
             "http://bioyond/report/Day2-result.zip",
             "http://bioyond/report/readme.txt",
@@ -1542,6 +1608,7 @@ def test_select_report_file_urls_keeps_all_pdfs_and_one_zip() -> None:
     )
 
     assert selected == [
+        "http://bioyond/report/summary.xlsx",
         "http://bioyond/report/a.pdf",
         "http://bioyond/report/b.PDF",
         "http://bioyond/report/Day3-result.zip",

@@ -198,7 +198,7 @@ class BioyondDeviceProxyBase:
     id="bioyond_proxy_peptide_robot",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站协作机器人代理设备",
-    displayname="协作机器人",
+    display_name="协作机器人",
 )
 class BioyondRobotProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='下使能')
@@ -230,7 +230,7 @@ class BioyondRobotProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_lcms",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站 LCMS 代理设备",
-    displayname="LCMS",
+    display_name="LCMS",
 )
 class BioyondLCMSProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='进板')
@@ -274,7 +274,7 @@ class BioyondLCMSProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_tecan_liquid_handler",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站自动移液工作站代理设备",
-    displayname="自动移液工作站",
+    display_name="自动移液工作站",
 )
 class BioyondTecanLiquidHandlerProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='转板1')
@@ -342,7 +342,7 @@ class BioyondTecanLiquidHandlerProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_g3_liquid_handler",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站液体工作站代理设备",
-    displayname="液体工作站",
+    display_name="液体工作站",
 )
 class BioyondG3LiquidHandlerProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='设置灯光状态')
@@ -416,7 +416,7 @@ class BioyondG3LiquidHandlerProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_idot_liquid_handler",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站 IDOT 代理设备",
-    displayname="非接触式纳升级移液系统",
+    display_name="非接触式纳升级移液系统",
 )
 class BioyondIDOTLiquidHandlerProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='执行移液程序')
@@ -448,7 +448,7 @@ class BioyondIDOTLiquidHandlerProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_synthesizer",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站全自动多肽合成系统代理设备",
-    displayname="全自动多肽合成系统",
+    display_name="全自动多肽合成系统",
 )
 class BioyondPeptideSynthesizerProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='运行协议')
@@ -516,7 +516,7 @@ class BioyondPeptideSynthesizerProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_plate_sealer",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站全自动热封膜仪代理设备",
-    displayname="全自动热封膜仪",
+    display_name="全自动热封膜仪",
 )
 class BioyondPlateSealerProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='开始封膜')
@@ -536,7 +536,7 @@ class BioyondPlateSealerProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_nitrogen_blow",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站双位氮吹仪代理设备",
-    displayname="双位氮吹仪",
+    display_name="双位氮吹仪",
 )
 class BioyondNitrogenBlowProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='启动氮吹')
@@ -574,7 +574,7 @@ class BioyondNitrogenBlowProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_centrifuge",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站定位离心机代理设备",
-    displayname="定位离心机",
+    display_name="定位离心机",
 )
 class BioyondCentrifugeProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='开始工作')
@@ -642,7 +642,7 @@ class BioyondCentrifugeProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_plate_peeler",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站全自动撕膜仪代理设备",
-    displayname="全自动撕膜仪",
+    display_name="全自动撕膜仪",
 )
 class BioyondPlatePeelerProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='清错')
@@ -656,7 +656,7 @@ class BioyondPlatePeelerProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_fridge",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站冰箱代理设备",
-    displayname="冰箱",
+    display_name="冰箱",
 )
 class BioyondFridgeProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='开门')
@@ -694,7 +694,7 @@ class BioyondFridgeProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_hotel",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站自动化堆栈代理设备",
-    displayname="自动化堆栈",
+    display_name="自动化堆栈",
 )
 class BioyondHotelProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='堆栈出库')
@@ -720,7 +720,7 @@ class BioyondHotelProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_default_stack",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站缓冲位代理设备",
-    displayname="缓冲位",
+    display_name="缓冲位",
 )
 class BioyondDefaultStackProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='清错')
@@ -734,7 +734,7 @@ class BioyondDefaultStackProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_turntable",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站转台代理设备",
-    displayname="转台",
+    display_name="转台",
 )
 class BioyondTurntableProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='旋转到绝对角度')
@@ -772,7 +772,7 @@ class BioyondTurntableProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_hotel_inout_pos",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站自动堆栈上下料位代理设备",
-    displayname="自动堆栈上下料位",
+    display_name="自动堆栈上下料位",
 )
 class BioyondHotelInOutPosProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='清错')
@@ -798,7 +798,7 @@ class BioyondHotelInOutPosProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_plate_reader",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站酶标仪代理设备",
-    displayname="酶标仪",
+    display_name="酶标仪",
 )
 class BioyondPlateReaderProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='进板')
@@ -830,7 +830,7 @@ class BioyondPlateReaderProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_label_printer",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站贴标机代理设备",
-    displayname="贴标机",
+    display_name="贴标机",
 )
 class BioyondLabelPrinterProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='BY_Print')
@@ -862,7 +862,7 @@ class BioyondLabelPrinterProxy(BioyondDeviceProxyBase):
     id="bioyond_proxy_peptide_safety_monitor",
     category=["device", "bioyond", "peptide"],
     description="Bioyond 多肽站安全门监控代理设备",
-    displayname="安全门监控",
+    display_name="安全门监控",
 )
 class BioyondSafetyMonitorProxy(BioyondDeviceProxyBase):
     @action(always_free=True, description='清错')

@@ -32,6 +32,20 @@ from pylabrobot.resources.resource import Resource as ResourcePLR
 from .workstation_http_service import WorkstationHTTPService
 
 
+def _runtime_working_dir() -> Path:
+    """Return Uni-Lab-OS' resolved runtime working directory."""
+    try:
+        from unilabos.config.config import BasicConfig
+
+        working_dir = getattr(BasicConfig, "working_dir", None)
+    except Exception:
+        working_dir = None
+
+    if working_dir:
+        return Path(working_dir).expanduser()
+    return Path.cwd() / "unilabos_data"
+
+
 class ConnectionMonitor:
     """Bioyond连接监控器"""
     def __init__(self, workstation, check_interval=30):
@@ -1219,9 +1233,9 @@ class BioyondWorkstation(WorkstationBase):
     集成Bioyond物料管理的工作站实现
     """
 
-    # 子类（如 sirna / peptide）覆写以指定默认 raw-call 日志目录。
-    # 路径相对仓库根；为 None 时若 debug_log=True 仍会写入临时位置。
-    _DEBUG_LOG_DEFAULT_DIR: Optional[str] = None
+    # 子类（如 sirna / peptide）可覆写默认 raw-call 日志目录。
+    # 相对路径按 Uni-Lab-OS runtime working_dir 解析，和 unilabos_data/logs 同根。
+    _DEBUG_LOG_DEFAULT_DIR: Optional[str] = "api_logs"
 
     def _create_bioyond_rpc(self, config: Dict[str, Any]) -> BioyondV1RPC:
         """创建 Bioyond RPC 客户端并应用调试包装。
@@ -1244,13 +1258,13 @@ class BioyondWorkstation(WorkstationBase):
         """解析 ``debug_log_dir`` 为绝对路径。"""
         configured = (getattr(self, "bioyond_config", {}) or {}).get("debug_log_dir")
         default_dir = getattr(self, "_DEBUG_LOG_DEFAULT_DIR", None)
-        candidate = configured or default_dir or "bioyond_debug_records"
+        candidate = configured or default_dir or "api_logs"
         path = Path(candidate)
         if not path.is_absolute():
-            # 本包是外部设备包，安装路径深度不固定（旧 monorepo 的 parents[4]
-            # 在浅路径如 D:\LabDeviceBioyondPeptide 下会 IndexError）。相对
-            # debug_log_dir 一律以 unilab 启动时的工作目录为基准。
-            path = Path.cwd() / path
+            parts = path.parts
+            if parts and parts[0] == "unilabos_data":
+                path = Path(*parts[1:]) if len(parts) > 1 else Path()
+            path = _runtime_working_dir() / path
         return path
 
     def _ensure_debug_log_state(self) -> None:

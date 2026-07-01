@@ -46,7 +46,7 @@
           }
         },
         "debug_log": true,
-        "debug_log_dir": "temp_benyao/peptide/api_logs",
+        "debug_log_dir": "api_logs",
         "size_x": 220.0,
         "size_y": 80.0,
         "size_z": 1500.0

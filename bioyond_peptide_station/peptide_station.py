@@ -914,6 +914,22 @@ class BioyondPeptideStation(BioyondWorkstation):
     def _url_path_lower(url: str) -> str:
         return str(url or "").split("?", 1)[0].lower()
 
+    @staticmethod
+    def _report_attachment_patterns(
+        *,
+        include_xlsx: bool,
+        include_pdf: bool,
+        include_zip: bool,
+    ) -> List[str]:
+        patterns: List[str] = []
+        if include_xlsx:
+            patterns.append("*.xlsx")
+        if include_pdf:
+            patterns.append("*.pdf")
+        if include_zip:
+            patterns.append("*.zip")
+        return patterns
+
     @classmethod
     def _day_number_from_report_url(cls, url: str) -> Optional[int]:
         name = cls._path_basename(str(url or "").split("?", 1)[0])
@@ -926,37 +942,45 @@ class BioyondPeptideStation(BioyondWorkstation):
         urls: List[str],
         *,
         preferred_zip: str = "",
+        include_xlsx: bool = True,
+        include_pdf: bool = True,
+        include_zip: bool = True,
     ) -> Tuple[List[str], List[str], List[str]]:
         deduped = list(dict.fromkeys(str(url or "").strip() for url in urls if str(url or "").strip()))
+        xlsx_urls = [url for url in deduped if cls._url_path_lower(url).endswith(".xlsx")]
         pdf_urls = [url for url in deduped if cls._url_path_lower(url).endswith(".pdf")]
         zip_urls = [url for url in deduped if cls._url_path_lower(url).endswith(".zip")]
         unsupported_urls = [
             url for url in deduped
-            if not cls._url_path_lower(url).endswith((".pdf", ".zip"))
+            if not cls._url_path_lower(url).endswith((".pdf", ".xlsx", ".zip"))
         ]
 
         selected_zip = ""
-        day_zip_pairs = [
-            (day, url)
-            for url in zip_urls
-            for day in [cls._day_number_from_report_url(url)]
-            if day is not None
-        ]
-        if day_zip_pairs:
-            latest_day = max(day for day, _ in day_zip_pairs)
-            selected_zip = [url for day, url in day_zip_pairs if day == latest_day][-1]
-        elif zip_urls:
-            normalized_preferred = str(preferred_zip or "").strip()
-            selected_zip = normalized_preferred if normalized_preferred in zip_urls else zip_urls[-1]
+        if include_zip:
+            day_zip_pairs = [
+                (day, url)
+                for url in zip_urls
+                for day in [cls._day_number_from_report_url(url)]
+                if day is not None
+            ]
+            if day_zip_pairs:
+                latest_day = max(day for day, _ in day_zip_pairs)
+                selected_zip = [url for day, url in day_zip_pairs if day == latest_day][-1]
+            elif zip_urls:
+                normalized_preferred = str(preferred_zip or "").strip()
+                selected_zip = normalized_preferred if normalized_preferred in zip_urls else zip_urls[-1]
 
-        selected_urls = [
-            url for url in deduped
-            if url in pdf_urls or (selected_zip and url == selected_zip)
-        ]
+        selected_urls: List[str] = []
+        if include_xlsx:
+            selected_urls.extend(xlsx_urls)
+        if include_pdf:
+            selected_urls.extend(pdf_urls)
+        if selected_zip:
+            selected_urls.append(selected_zip)
         skipped_zip_urls = [
             url for url in zip_urls
             if url != selected_zip
-        ]
+        ] if include_zip else []
         return selected_urls, unsupported_urls, skipped_zip_urls
 
     @classmethod
@@ -3415,6 +3439,9 @@ class BioyondPeptideStation(BioyondWorkstation):
             "task_id": "",
             "order_id": "",
             "order_info": {},
+            "include_xlsx": True,
+            "include_pdf": True,
+            "include_zip": True,
             "download_dir": "",
         },
         description="将奔曜实验报告文件写入 Notebook",
@@ -3482,6 +3509,9 @@ class BioyondPeptideStation(BioyondWorkstation):
         task_id: str = "",
         order_id: str = "",
         order_info: Any = None,
+        include_xlsx: bool = True,
+        include_pdf: bool = True,
+        include_zip: bool = True,
         download_dir: str = "",
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -3490,6 +3520,9 @@ class BioyondPeptideStation(BioyondWorkstation):
         Args:
             files[报告文件列表]: 上游查询到的报告文件地址列表。
             file_zip[报告 ZIP 文件]: 上游查询到的报告 ZIP 文件地址。
+            include_xlsx[插入 Excel 附件]: 将 Excel 报告附件写入 Notebook。
+            include_pdf[插入 PDF 附件]: 将 PDF 报告附件写入 Notebook。
+            include_zip[插入 ZIP 附件]: 将 ZIP 报告附件写入 Notebook。
             order_id[<order_id>]: 奔曜内部标识，通常由上游节点传入。
             order_info[<order_info>]: 上游实验列表节点返回的实验信息，通常自动传入。
             notebook_id[<notebook_id>]: 当前实验记录的 Notebook ID；未填写时从运行上下文自动获取。
@@ -3510,9 +3543,15 @@ class BioyondPeptideStation(BioyondWorkstation):
         supported_urls, skipped_urls, skipped_zip_urls = self._select_report_file_urls(
             urls,
             preferred_zip=zip_url,
+            include_xlsx=bool(include_xlsx),
+            include_pdf=bool(include_pdf),
+            include_zip=bool(include_zip),
         )
-        if not supported_urls:
-            raise FileNotFoundError("未找到可写入 Notebook 的 PDF 或 ZIP 报告文件")
+        attachment_patterns = self._report_attachment_patterns(
+            include_xlsx=bool(include_xlsx),
+            include_pdf=bool(include_pdf),
+            include_zip=bool(include_zip),
+        )
 
         from bioyond_peptide_station import notebook_client as nbc
 
@@ -3526,6 +3565,7 @@ class BioyondPeptideStation(BioyondWorkstation):
                 f"{f'（order_id={str(order_id).strip()}）' if str(order_id or '').strip() else ''}。"
             ),
             nbc.build_table_node(["字段", "Field", "值 / Value"], metadata_rows, col_sizes=[140, 160, 360]),
+            nbc.text_block(f"附件：{', '.join(attachment_patterns) if attachment_patterns else '无，未勾选插入附件'}"),
         ]
         for index, url in enumerate(supported_urls, start=1):
             downloaded = self._download_url_to_local(
@@ -3552,6 +3592,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             "order_id": str(order_id or "").strip(),
             "order_info": self._coerce_order_info(order_info),
             "order_metadata_rows": metadata_rows,
+            "selected_attachment_patterns": attachment_patterns,
             "files": urls,
             "selected_files": supported_urls,
             "downloaded_files": downloaded_files,

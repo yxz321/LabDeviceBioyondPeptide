@@ -27,6 +27,24 @@ from pathlib import Path
 from unilabos.utils.log import logger
 
 
+def _runtime_working_dir() -> Path:
+    """Return Uni-Lab-OS' resolved runtime working directory."""
+    try:
+        from unilabos.config.config import BasicConfig
+
+        working_dir = getattr(BasicConfig, "working_dir", None)
+    except Exception:
+        working_dir = None
+
+    if working_dir:
+        return Path(working_dir).expanduser()
+    return Path.cwd() / "unilabos_data"
+
+
+def _http_reports_dir() -> Path:
+    return _runtime_working_dir() / "http_reports"
+
+
 @dataclass
 class WorkstationReportRequest:
     """统一工作站报送请求（基于LIMS协议规范）"""
@@ -617,7 +635,7 @@ class WorkstationHTTPHandler(BaseHTTPRequestHandler):
 
     def _save_raw_request(self, endpoint: str, request_data: Dict[str, Any]) -> None:
         try:
-            base_dir = Path(__file__).resolve().parents[3] / "unilabos_data" / "http_reports"
+            base_dir = _http_reports_dir()
             base_dir.mkdir(parents=True, exist_ok=True)
             log_path = getattr(self.workstation, "_http_log_path", None)
             log_file = Path(log_path) if log_path else (base_dir / f"http_{int(time.time()*1000)}.log")
@@ -656,7 +674,7 @@ class WorkstationHTTPService:
 
             # 创建HTTP服务器
             self.server = HTTPServer((self.host, self.port), handler_factory)
-            base_dir = Path(__file__).resolve().parents[3] / "unilabos_data" / "http_reports"
+            base_dir = _http_reports_dir()
             base_dir.mkdir(parents=True, exist_ok=True)
             session_log = base_dir / f"http_{int(time.time()*1000)}.log"
             setattr(self.workstation, "_http_log_path", str(session_log))

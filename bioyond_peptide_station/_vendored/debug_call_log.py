@@ -8,7 +8,7 @@ returned. Outside of an active session the wrapped method delegates to the
 original (unwrapped) implementation, leaving non-debug behavior intact.
 
 The session writes a Markdown file under ``out_dir`` mirroring the format of
-``bioyond_debug_records/2026-04-30_160316_day3_samplefile_only_raw_calls.md``
+``api_logs/2026-04-30_160316_day3_samplefile_only_raw_calls.md``
 minus the "Raw Payload Argument" section.
 
 This module has no dependency on ``BioyondV1RPC`` itself; the only contract is
