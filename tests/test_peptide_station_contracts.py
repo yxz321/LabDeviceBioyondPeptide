@@ -337,11 +337,11 @@ def test_registry_surface_labels_follow_action_args_contract_ast() -> None:
 
     start_doc = ast.get_docstring(_station_method_ast("start_experiment")) or ""
     assert "order_id[<order_id>*]" in start_doc
-    assert "resultTable[<resultTable>]" in start_doc
+    assert "resultTable[装载确认表*]" in start_doc
 
     unload_doc = ast.get_docstring(_station_method_ast("unload_materials")) or ""
     assert "order_id[<order_id>*]" in unload_doc
-    assert "resultTable[<resultTable>]" in unload_doc
+    assert "resultTable[下料指引表*]" in unload_doc
 
 
 def test_required_input_handle_labels_mark_required_star_ast() -> None:
@@ -645,6 +645,16 @@ def test_filename_matches_pattern_substring_and_glob() -> None:
     assert station._filename_matches_pattern("a.xlsx", "*.xlsx")
     assert not station._filename_matches_pattern("a.xlsx", "*.docx")
     assert station._filename_matches_pattern("a.xlsx", "")
+
+
+def test_sample_excel_transfer_handles_exclude_content_type() -> None:
+    download_keys = set(_action_output_handle_keys("download_sample_excel_from_notebook"))
+    assert {"file_path", "sample_excel_pattern", "notebook_id"} <= download_keys
+    assert "content_type" not in download_keys
+
+    upload_keys = set(_action_input_handle_keys("upload_sample_excel"))
+    assert "file_path" in upload_keys
+    assert "content_type" not in upload_keys
 
 
 # ---------------------------------------------------------------------------
@@ -1431,7 +1441,9 @@ def test_download_sample_excel_from_notebook_downloads_file_node(
     cls = getattr(_import_module(), CLASS_NAME)
     meta = getattr(cls.download_sample_excel_from_notebook, "_action_registry_meta", {})
     assert meta.get("goal_default")["file_name_filter"] == "*.xlsx"
-    assert {"file_path", "content_type", "sample_excel_pattern", "notebook_id"} <= set(_action_handle_keys(meta))
+    handle_keys = set(_action_handle_keys(meta))
+    assert {"file_path", "sample_excel_pattern", "notebook_id"} <= handle_keys
+    assert "content_type" not in handle_keys
 
 
 def test_attach_order_report_files_to_notebook_uploads_and_appends(

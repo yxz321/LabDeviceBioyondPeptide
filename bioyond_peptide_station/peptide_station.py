@@ -1251,9 +1251,9 @@ class BioyondPeptideStation(BioyondWorkstation):
         description="等待奔曜调度异常；可自动跳过已知可忽略错误，其余异常交给人工确认。",
         handles=[
             ActionOutputHandle(key="available_options", data_type="array", label="可选处理方式", data_key="available_options", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(key="token", data_type="str", label="错误标识", data_key="token", data_source=DataSource.EXECUTOR),
-            ActionOutputHandle(key="error_report", data_type="object", label="错误详情", data_key="error_report", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="token", data_type="str", label="<token>", data_key="token", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="error_message", data_type="str", label="错误说明", data_key="error_message", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="error_report", data_type="object", label="错误详情", data_key="error_report", data_source=DataSource.EXECUTOR),
         ],
     )
     def wait_for_error_handling(
@@ -1328,9 +1328,9 @@ class BioyondPeptideStation(BioyondWorkstation):
         feedback_interval=300,
         description="现场确认调度异常的处理方式：重试当前步骤、跳过当前步骤或结束实验。",
         handles=[
-            ActionInputHandle(key="token", data_type="str", label="错误标识*", data_key="token", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="token", data_type="str", label="<token>*", data_key="token", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="error_message", data_type="text", label="错误说明*", data_key="error_message", data_source=DataSource.HANDLE, io_type="source"),
             ActionInputHandle(key="error_report", data_type="object", label="错误详情", data_key="error_report", data_source=DataSource.HANDLE, io_type="source"),
-            ActionInputHandle(key="error_message", data_type="text", label="错误说明", data_key="error_message", data_source=DataSource.HANDLE, io_type="source"),
         ],
     )
     def reply_error_handling(
@@ -1347,7 +1347,7 @@ class BioyondPeptideStation(BioyondWorkstation):
 
         Args:
             reply_choice[处理方式*]: 现场选择重试当前步骤、跳过当前步骤或结束实验。
-            error_message[错误说明]: 展示给确认人的错误说明，通常由上游等待节点传入。
+            error_message[错误说明*]: 展示给确认人的错误说明，通常由上游等待节点传入。
             timeout_seconds[等待超时时间]: 人工确认节点允许等待的最长秒数，默认 3600 秒。
             assignee_user_ids[确认人]: 指定需要完成人工确认的用户；为空时由默认流程处理。
             token[<token>*]: 上游等待节点传入的错误标识，通常无需手动填写。
@@ -1519,13 +1519,6 @@ class BioyondPeptideStation(BioyondWorkstation):
                 data_source=DataSource.EXECUTOR,
             ),
             ActionOutputHandle(
-                key="content_type",
-                data_type="str",
-                label="文件类型",
-                data_key="content_type",
-                data_source=DataSource.EXECUTOR,
-            ),
-            ActionOutputHandle(
                 key="sample_excel_pattern",
                 data_type="str",
                 label="样品excel名称",
@@ -1619,14 +1612,6 @@ class BioyondPeptideStation(BioyondWorkstation):
                 data_type="str",
                 label="<file_path>*",
                 data_key="file_path",
-                data_source=DataSource.HANDLE,
-                io_type="source",
-            ),
-            ActionInputHandle(
-                key="content_type",
-                data_type="str",
-                label="文件类型",
-                data_key="content_type",
                 data_source=DataSource.HANDLE,
                 io_type="source",
             ),
@@ -2121,8 +2106,8 @@ class BioyondPeptideStation(BioyondWorkstation):
         feedback_interval=300,
         description=CEM_INFO_CONFIRM_MESSAGE,
         handles=[
-            ActionInputHandle(key="cem_info_url", data_type="str", label="CEM 校验链接", data_key="cem_info_url", data_source=DataSource.HANDLE, io_type="source"),
-            ActionInputHandle(key="cem_method_file_name", data_type="str", label="CEM方法文件", data_key="cem_method_file_name", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="cem_info_url", data_type="str", label="CEM 校验链接*", data_key="cem_info_url", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="cem_method_file_name", data_type="str", label="CEM方法文件*", data_key="cem_method_file_name", data_source=DataSource.HANDLE, io_type="source"),
         ],
     )
     def confirm_cem_info(
@@ -2136,10 +2121,10 @@ class BioyondPeptideStation(BioyondWorkstation):
         """展示 CEM 校验信息。
 
         Args:
+            cem_info_url[<cem_info_url>*]: 上游节点生成的 CEM 校验文件链接。
+            cem_method_file_name[CEM方法文件*]: 本次 Day1 使用的 CEM 方法文件，通常由上游节点自动传入。
             timeout_seconds[等待超时时间]: 人工确认或等待完成时允许等待的最长秒数；0 表示不限时。
             assignee_user_ids[确认人]: 指定需要完成人工确认的用户；为空时由默认流程处理。
-            cem_method_file_name[CEM方法文件]: 本次 Day1 使用的 CEM 方法文件，通常由上游节点自动传入。
-            cem_info_url[<cem_info_url>]: 上游节点生成的 CEM 校验文件链接。
         """
         del timeout_seconds, assignee_user_ids, kwargs
         return {
@@ -2284,7 +2269,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         handles=[
             ActionInputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>*", data_key="order_id", data_source=DataSource.HANDLE, io_type="source"),
             ActionInputHandle(key="order_ids", data_type="bioyond_order_ids", label="<order_ids>", data_key="order_ids", data_source=DataSource.HANDLE, io_type="source"),
-            ActionInputHandle(key="resultTable", data_type="table", label="装载确认表", data_key="resultTable", data_source=DataSource.HANDLE, io_type="source"),
+            ActionInputHandle(key="resultTable", data_type="table", label="装载确认表*", data_key="resultTable", data_source=DataSource.HANDLE, io_type="source"),
             ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="order_ids", data_type="bioyond_order_ids", label="<order_ids>", data_key="order_ids", data_source=DataSource.EXECUTOR),
             ActionOutputHandle(key="order_code", data_type="bioyond_order_code", label="实验编号", data_key="order_code", data_source=DataSource.EXECUTOR),
@@ -2303,7 +2288,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         Args:
             order_id[<order_id>*]: 奔曜内部标识，通常由上游节点传入。
             order_ids[<order_ids>]: 奔曜内部标识列表，通常由上游节点传入。
-            resultTable[<resultTable>]: 上游节点生成的操作指引表，用于人工确认装载或下料。
+            resultTable[装载确认表*]: 上游节点生成的物料信息表，用于人工确认装载或下料。
         """
         with self._debug_call_session("start_experiment"):
             resolved_order_ids = self._extract_order_ids(order_id=order_id, order_ids=order_ids, **kwargs)
@@ -2481,7 +2466,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(
                 key="order_code",
                 data_type="bioyond_order_code",
-                label="实验编号",
+                label="实验编号*",
                 data_key="order_code",
                 data_source=DataSource.HANDLE,
                 io_type="source",
@@ -2489,7 +2474,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(
                 key="order_id",
                 data_type="bioyond_order_id",
-                label="<order_id>",
+                label="<order_id>*",
                 data_key="order_id",
                 data_source=DataSource.HANDLE,
                 io_type="source",
@@ -2567,11 +2552,11 @@ class BioyondPeptideStation(BioyondWorkstation):
         """等待奔曜实验完成，并整理「下料指引表」给下游节点。
 
         Args:
-            order_code[实验编号]: 用于人工核对或查找的实验编号，通常由上游节点传入。
+            order_code[实验编号*]: 用于人工核对或查找的实验编号，通常由上游节点传入。
             timeout_seconds[等待超时时间]: 人工确认或等待完成时允许等待的最长秒数；0 表示不限时。
             poll_mode[轮询等待]: 等待过程中定期检查完成状态，通常保持开启。
             poll_interval_seconds[轮询间隔]: 开启轮询等待时，每次检查之间的秒数。
-            order_id[<order_id>]: 奔曜内部标识，通常由上游节点传入。
+            order_id[<order_id>*]: 奔曜内部标识，通常由上游节点传入。
             order_ids[<order_ids>]: 奔曜内部标识列表，通常由上游节点传入。
 
         Returns:
@@ -2766,7 +2751,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(
                 key="resultTable",
                 data_type="table",
-                label="下料指引表",
+                label="下料指引表*",
                 data_key="resultTable",
                 data_source=DataSource.HANDLE,
                 io_type="source",
@@ -2808,7 +2793,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             timeout_seconds[等待超时时间]: 人工确认或等待完成时允许等待的最长秒数；0 表示不限时。
             assignee_user_ids[确认人]: 指定需要完成人工确认的用户；为空时由默认流程处理。
             order_id[<order_id>*]: 奔曜内部标识，通常由上游节点传入。
-            resultTable[<resultTable>]: 上游节点生成的操作指引表，用于人工确认装载或下料。
+            resultTable[下料指引表*]: 上游节点生成的物料信息表，用于人工确认装载或下料。
 
         Returns:
             含 ``success`` / ``order_id`` / ``take_out_result`` / ``confirmation_message`` 的字典。
@@ -3449,7 +3434,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(
                 key="files",
                 data_type="array",
-                label="报告文件列表",
+                label="报告文件列表*",
                 data_key="files",
                 data_source=DataSource.HANDLE,
                 io_type="source",
@@ -3457,7 +3442,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(
                 key="file_zip",
                 data_type="str",
-                label="报告 ZIP 文件",
+                label="报告 ZIP 文件*",
                 data_key="file_zip",
                 data_source=DataSource.HANDLE,
                 io_type="source",
@@ -3465,7 +3450,7 @@ class BioyondPeptideStation(BioyondWorkstation):
             ActionInputHandle(
                 key="order_id",
                 data_type="bioyond_order_id",
-                label="<order_id>",
+                label="<order_id>*",
                 data_key="order_id",
                 data_source=DataSource.HANDLE,
                 io_type="source",
@@ -3518,12 +3503,12 @@ class BioyondPeptideStation(BioyondWorkstation):
         """将奔曜实验报告文件上传并写入当前实验记录。
 
         Args:
-            files[报告文件列表]: 上游查询到的报告文件地址列表。
-            file_zip[报告 ZIP 文件]: 上游查询到的报告 ZIP 文件地址。
+            files[报告文件列表*]: 上游查询到的报告文件地址列表。
+            file_zip[报告 ZIP 文件*]: 上游查询到的报告 ZIP 文件地址。
             include_xlsx[插入 Excel 附件]: 将 Excel 报告附件写入 Notebook。
             include_pdf[插入 PDF 附件]: 将 PDF 报告附件写入 Notebook。
             include_zip[插入 ZIP 附件]: 将 ZIP 报告附件写入 Notebook。
-            order_id[<order_id>]: 奔曜内部标识，通常由上游节点传入。
+            order_id[<order_id>*]: 奔曜内部标识，通常由上游节点传入。
             order_info[<order_info>]: 上游实验列表节点返回的实验信息，通常自动传入。
             notebook_id[<notebook_id>]: 当前实验记录的 Notebook ID；未填写时从运行上下文自动获取。
             task_id[<task_id>]: 当前工作流任务 ID；通常由系统自动提供，手动测试时可填写。
