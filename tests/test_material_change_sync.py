@@ -1172,6 +1172,45 @@ def test_full_sync_delete_absent_sweep_only_roots_with_stale_bioyond_id(
     assert holding in station.deck.children
 
 
+def test_full_sync_clear_stale_removes_idless_material_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: SimpleNamespace,
+) -> None:
+    station = _fresh_station(monkeypatch, runtime)
+    synchronizer = station.resource_synchronizer
+
+    station.process_material_change_report(_base_report("A-idless-sweep", "保留底座", x=1, y=1))
+    kept = _resource_by_bioyond_id(station.deck, "A-idless-sweep")
+
+    from pylabrobot.resources import Resource as _Res
+
+    kept_child = _Res(name="kept-child-no-id", size_x=1, size_y=1, size_z=1)
+    kept_child.unilabos_extra = {}
+    station._assign_child_to_parent_slot(kept, kept_child)
+
+    stale_root = _Res(name="stale-root-no-id", size_x=1, size_y=1, size_z=1)
+    stale_root.unilabos_extra = {}
+    assert station._move_resource_to_warehouse_slot(stale_root, station.deck.warehouses[AUTO_WAREHOUSE], 5)
+    assert getattr(stale_root, "parent", None) is station.deck.warehouses[AUTO_WAREHOUSE]
+
+    station.hardware_interface.stock_material_rows = [
+        _base_report("A-idless-sweep", "保留底座", x=1, y=1),
+    ]
+
+    ok = synchronizer.sync_from_external(clear_stale=True)
+    assert ok is True
+
+    assert _resource_by_bioyond_id(station.deck, "A-idless-sweep") is not None
+    assert any(getattr(r, "name", "") == "kept-child-no-id" for r in _walk(station.deck)), (
+        "被保留物料根下的无 id 子资源不应被独立删除"
+    )
+    assert not any(getattr(r, "name", "") == "stale-root-no-id" for r in _walk(station.deck)), (
+        "clear_stale=True 应删除无 Bioyond id 的旧物料根"
+    )
+    assert station.deck.warehouses
+    assert _virtual_holding_node(station) is not None
+
+
 def test_full_sync_does_not_independently_delete_children_lacking_bioyond_id(
     monkeypatch: pytest.MonkeyPatch,
     runtime: SimpleNamespace,

@@ -172,8 +172,8 @@ class BioyondResourceSynchronizer(ResourceSynchronizer):
           返回失败、不改缓存/deck。
         - 每个返回物料走工作站 process_material_change_report 的 upsert（move 优先，
           on_empty_locations="park"，source=stock_material，复用并维护瞬态 lookup）。
-        - 仅当 clear_stale：跑删除缺失清扫——删除 deck 上携带 bioyond_id 但不在本次
-          返回集合中的根资源子树（排除仓库与虚拟暂存节点）。
+        - 仅当 clear_stale：跑删除缺失清扫——删除 deck 上不在本次返回集合中的
+          物料根子树，包括缺失 bioyond_id 的旧物料根（排除仓库与虚拟暂存节点）。
 
         返回 bool（沿用历史契约）；详细/失败信息写入 self.last_sync_result，
         失败时 last_sync_result["success"]=False 且带 message。
@@ -251,8 +251,8 @@ class BioyondResourceSynchronizer(ResourceSynchronizer):
                     if result.get("action") in ("add", "move"):
                         placed_count += 1
 
-            # 删除缺失清扫：仅 clear_stale。删除携带 bioyond_id 且不在 returned_ids
-            # 的根资源子树（排除仓库 / 虚拟暂存节点）。
+            # 删除缺失清扫：仅 clear_stale。删除不在 returned_ids 的物料根子树，
+            # 包括缺失 bioyond_id 的旧物料根（排除仓库 / 虚拟暂存节点）。
             removed_stale_count = 0
             removed_stale_cache_count = 0
             if clear_stale:
@@ -2247,6 +2247,19 @@ class BioyondWorkstation(WorkstationBase):
             return material_id
         return self._legacy_bioyond_id_from_value(extra_info) or self._legacy_bioyond_id_from_value(resource)
 
+    def _is_clear_stale_material_candidate(self, resource: ResourcePLR) -> bool:
+        """Return True for deck material instances that clear-stale may remove."""
+        if resource is getattr(self, "deck", None):
+            return False
+        if self._is_virtual_holding_node(resource):
+            return False
+        if isinstance(resource, WareHouse):
+            return False
+        category = str(getattr(resource, "category", "") or "").strip()
+        if category in {"warehouse", "device", "workstation", "virtual_holding"}:
+            return False
+        return True
+
     def _has_bioyond_id_ancestor(self, resource: ResourcePLR, candidates: set[int]) -> bool:
         parent = getattr(resource, "parent", None)
         while parent is not None:
@@ -2295,11 +2308,13 @@ class BioyondWorkstation(WorkstationBase):
         returned_ids: set,
         publish_roots: Optional[List[ResourcePLR]] = None,
     ) -> int:
-        """删除缺失清扫：删除 deck 上携带 bioyond_id 但不在 returned_ids 的根资源子树。
+        """删除缺失清扫：删除 deck 上不在 returned_ids 的物料根子树。
 
         复用 _clear_external_sync_bioyond_materials 的根级过滤；显式排除仓库与虚拟
-        暂存节点（按身份/名称，不靠模糊判断）。不独立删除无 bioyond_id 的资源——它们
-        只随祖先子树级联删除。returned_ids 为空集（真·空成功）时删除全部 bioyond_id 根。
+        暂存节点（按身份/名称，不靠模糊判断）。资源带 bioyond_id 时按 returned_ids
+        保留；没有 bioyond_id 的物料根也删除，以兼容后端未持久化 extra 的旧资源树。
+        不独立删除被保留物料根下的子资源。returned_ids 为空集（真·空成功）时删除
+        全部物料根。
         """
         deck = getattr(self, "deck", None)
         if deck is None:
@@ -2309,17 +2324,17 @@ class BioyondWorkstation(WorkstationBase):
         candidates = [
             resource
             for resource in self._iter_resource_subtree(deck)
-            if resource is not deck
-            and self._resource_bioyond_id(resource)
-            and not self._is_virtual_holding_node(resource)
-            and getattr(resource, "category", "") != "warehouse"
+            if self._is_clear_stale_material_candidate(resource)
         ]
         candidate_ids = {id(resource) for resource in candidates}
         roots = [
             resource
             for resource in candidates
             if not self._has_bioyond_id_ancestor(resource, candidate_ids)
-            and self._resource_bioyond_id(resource) not in wanted
+            and (
+                not self._resource_bioyond_id(resource)
+                or self._resource_bioyond_id(resource) not in wanted
+            )
         ]
         removed = 0
         for resource in roots:
@@ -2328,7 +2343,7 @@ class BioyondWorkstation(WorkstationBase):
                 removed += 1
                 logger.info(
                     f"[Bioyond删除缺失清扫] 删除不在返回集合的旧物料: "
-                    f"id={bioyond_id} name={getattr(resource, 'name', None)}"
+                    f"id={bioyond_id or '<missing>'} name={getattr(resource, 'name', None)}"
                 )
         return removed
 
