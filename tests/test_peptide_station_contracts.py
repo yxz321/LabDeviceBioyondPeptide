@@ -923,21 +923,21 @@ def test_submit_experiment_day1_calls_pipeline_and_injects_default_cem_method() 
     assert any(entry["key"] == "SampleFile" and entry["value"] == "upload\\sample\\f.xlsx" for entry in sent_params)
 
 
-def test_prepare_cem_uses_peptide_rpc_post_and_default_method() -> None:
+def test_prepare_cem_uses_peptide_rpc_post_and_required_method() -> None:
     station = _make_station()
     station.hardware_interface.post.return_value = {"code": 1, "data": "/files/cem.pdf"}
-    out = station.prepare_cem(cem_method_file_name="", sample_excel_relative_path="upload/sample/f.xlsx")
+    out = station.prepare_cem(cem_method_file_name="method.MPM", sample_excel_relative_path="upload/sample/f.xlsx")
     args, kwargs = station.hardware_interface.post.call_args
     assert kwargs["url"] == "http://test/api/lims/order/prepare-cEM"
     body = kwargs["params"]
     assert body["apiKey"] == "k"
     assert body["data"] == {
-        "methodFileName": "5microdouble-20250911.MPM",
+        "methodFileName": "method.MPM",
         "excelPath": r"upload\sample\f.xlsx",
     }
     assert "commonlyOrderId" not in body["data"]
     assert out["success"] is True
-    assert out["cem_method_file_name"] == "5microdouble-20250911.MPM"
+    assert out["cem_method_file_name"] == "method.MPM"
     assert out["sample_excel_relative_path"] == "upload\\sample\\f.xlsx"
     assert out["cem_pdf_path"] == "/files/cem.pdf"
     assert out["cem_info_url"] == "http://test/files/cem.pdf"
@@ -950,9 +950,17 @@ def test_prepare_cem_preserves_raw_pdf_path_but_normalizes_url() -> None:
         "code": 1,
         "data": r"upload\Report\DPR019\1-CEM.pdf",
     }
-    out = station.prepare_cem(sample_excel_relative_path=r"upload\sample\f.xlsx")
+    out = station.prepare_cem(cem_method_file_name="method.MPM", sample_excel_relative_path=r"upload\sample\f.xlsx")
     assert out["cem_pdf_path"] == r"upload\Report\DPR019\1-CEM.pdf"
     assert out["cem_info_url"] == "http://test/upload/Report/DPR019/1-CEM.pdf"
+
+
+def test_prepare_cem_requires_method_in_signature_and_goal_default() -> None:
+    cls = getattr(_import_module(), CLASS_NAME)
+    sig = inspect.signature(cls.prepare_cem)
+    meta = getattr(cls.prepare_cem, "_action_registry_meta", {})
+    assert sig.parameters["cem_method_file_name"].default is inspect.Parameter.empty
+    assert meta.get("goal_default") == {"sample_excel_relative_path": ""}
 
 
 def test_prepare_cem_handle_keys() -> None:
@@ -969,7 +977,15 @@ def test_prepare_cem_handle_keys() -> None:
 def test_prepare_cem_rejects_missing_excel_path() -> None:
     station = _make_station()
     with pytest.raises(Exception):
-        station.prepare_cem(sample_excel_relative_path="")
+        station.prepare_cem(cem_method_file_name="method.MPM", sample_excel_relative_path="")
+    station.hardware_interface.post.assert_not_called()
+
+
+def test_prepare_cem_rejects_missing_method() -> None:
+    station = _make_station()
+    module = _import_module()
+    with pytest.raises(module.PeptideWorkflowError, match="cem_method_file_name"):
+        station.prepare_cem(cem_method_file_name="", sample_excel_relative_path="upload/sample/f.xlsx")
     station.hardware_interface.post.assert_not_called()
 
 
@@ -977,14 +993,14 @@ def test_prepare_cem_rejects_non_success_response() -> None:
     station = _make_station()
     station.hardware_interface.post.return_value = {"code": 0, "message": "bad"}
     with pytest.raises(RuntimeError):
-        station.prepare_cem(sample_excel_relative_path="upload/sample/f.xlsx")
+        station.prepare_cem(cem_method_file_name="method.MPM", sample_excel_relative_path="upload/sample/f.xlsx")
 
 
 def test_prepare_cem_rejects_missing_data() -> None:
     station = _make_station()
     station.hardware_interface.post.return_value = {"code": 1, "data": ""}
     with pytest.raises(RuntimeError):
-        station.prepare_cem(sample_excel_relative_path="upload/sample/f.xlsx")
+        station.prepare_cem(cem_method_file_name="method.MPM", sample_excel_relative_path="upload/sample/f.xlsx")
 
 
 def test_confirm_cem_info_metadata_shape() -> None:

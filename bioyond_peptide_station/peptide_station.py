@@ -2034,7 +2034,6 @@ class BioyondPeptideStation(BioyondWorkstation):
     @action(
         always_free=True,
         description="生成 Day1 CEM 校验信息",
-        goal_default={"cem_method_file_name": DAY1_CEM_METHOD_DEFAULT, "sample_excel_relative_path": ""},
         handles=[
             ActionInputHandle(
                 key="cem_method_file_name",
@@ -2058,19 +2057,21 @@ class BioyondPeptideStation(BioyondWorkstation):
     )
     def prepare_cem(
         self,
-        cem_method_file_name: str = DAY1_CEM_METHOD_DEFAULT,
+        cem_method_file_name: str,
         sample_excel_relative_path: str = "",
     ) -> Dict[str, Any]:
         """生成 Day1 CEM 校验信息。
 
         Args:
-            cem_method_file_name[CEM方法文件*]: 选择 Day1 使用的 CEM 方法文件；未填写时使用默认方法文件。
+            cem_method_file_name[CEM方法文件*]: 选择 Day1 使用的 CEM 方法文件。
             sample_excel_relative_path[<sample_excel_relative_path>*]: 上传或查询样品表后返回的内部文件路径，通常由上游节点自动传入。
         """
         excel_path = str(sample_excel_relative_path or "").strip().replace("/", "\\")
         if not excel_path:
             raise PeptideWorkflowError("prepare_cem 缺少 sample_excel_relative_path")
-        method = str(cem_method_file_name or DAY1_CEM_METHOD_DEFAULT).strip() or DAY1_CEM_METHOD_DEFAULT
+        method = str(cem_method_file_name or "").strip()
+        if not method:
+            raise PeptideWorkflowError("prepare_cem 缺少 cem_method_file_name")
         rpc = self._require_hardware_interface()
         api_host = str(getattr(rpc, "host", "") or self.bioyond_config.get("api_host", "")).rstrip("/")
         request_body = {
@@ -2121,7 +2122,7 @@ class BioyondPeptideStation(BioyondWorkstation):
         """展示 CEM 校验信息。
 
         Args:
-            cem_info_url[<cem_info_url>*]: 上游节点生成的 CEM 校验文件链接。
+            cem_info_url[CEM校验链接*]: 上游节点生成的 CEM 校验文件链接。
             cem_method_file_name[CEM方法文件*]: 本次 Day1 使用的 CEM 方法文件，通常由上游节点自动传入。
             timeout_seconds[等待超时时间]: 人工确认或等待完成时允许等待的最长秒数；0 表示不限时。
             assignee_user_ids[确认人]: 指定需要完成人工确认的用户；为空时由默认流程处理。
@@ -2286,9 +2287,11 @@ class BioyondPeptideStation(BioyondWorkstation):
         """展示物料装载表，并启动调度器。
 
         Args:
+            resultTable[装载确认表*]: 上游节点生成的物料信息表，用于人工确认装载或下料。
+            timeout_seconds[等待超时时间]: 人工确认或等待完成时允许等待的最长秒数；0 表示不限时。
+            assignee_user_ids[确认人]: 指定需要完成人工确认的用户；为空时由默认流程处理。
             order_id[<order_id>*]: 奔曜内部标识，通常由上游节点传入。
             order_ids[<order_ids>]: 奔曜内部标识列表，通常由上游节点传入。
-            resultTable[装载确认表*]: 上游节点生成的物料信息表，用于人工确认装载或下料。
         """
         with self._debug_call_session("start_experiment"):
             resolved_order_ids = self._extract_order_ids(order_id=order_id, order_ids=order_ids, **kwargs)
