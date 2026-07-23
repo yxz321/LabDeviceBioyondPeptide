@@ -1,0 +1,4 @@
+interface:
+  display_name: "添加 Uni-Lab 工作流节点"
+  short_description: "规范新增 Uni-Lab 工作流节点与参数元数据"
+  default_prompt: "Use $add-unilab-workflow-node to add or update a Uni-Lab workflow node with registry metadata."

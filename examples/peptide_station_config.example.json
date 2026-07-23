@@ -70,7 +70,7 @@
     }
   },
   "http_service_config": {
-    "http_service_host": "127.0.0.1",
+    "http_service_host": "0.0.0.0",
     "http_service_port": 8080
   }
 }

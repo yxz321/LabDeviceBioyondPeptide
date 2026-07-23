@@ -1,0 +1,4 @@
+interface:
+  display_name: "Uni-Lab Notebook Ops"
+  short_description: "Write runtime notebook helper code"
+  default_prompt: "Use $unilab-notebook-ops to write Uni-Lab runtime Python code that updates or reads notebook records through the helper."

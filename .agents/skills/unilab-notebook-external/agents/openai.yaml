@@ -1,0 +1,4 @@
+interface:
+  display_name: "Uni-Lab Notebook External"
+  short_description: "Write, attach, and download notebook files"
+  default_prompt: "Use $unilab-notebook-external to append text, attach local files, or download requested file attachments from a Uni-Lab notebook without a Uni-Lab install."

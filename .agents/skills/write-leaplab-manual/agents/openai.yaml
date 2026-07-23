@@ -1,0 +1,4 @@
+interface:
+  display_name: "LeapLab Manual Writer"
+  short_description: "Write LeapLab workflow manuals from API and code"
+  default_prompt: "Use $write-leaplab-manual to update the LeapLab manual for a workflow and its action nodes."

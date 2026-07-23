@@ -9,6 +9,7 @@ build/
 venv/
 .env
 *.pkl
+temp/
 
 # Uni-Lab-OS runtime artifacts
 unilabos_data/
@@ -16,9 +17,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+.DS_Store
 
 # Live/secret configs — never commit (keep *.example.json)
 examples/*.json
 !examples/*.example.json
 .claude
+.codex/
 examples/peptide_station_graph.with_bioyond_devices.json
