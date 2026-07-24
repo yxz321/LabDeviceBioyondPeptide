@@ -453,7 +453,9 @@ def test_required_actions_exposed() -> None:
         "prepare_cem",
         "confirm_cem_info",
         "submit_experiment_day2",
+        "submit_experiment_day2_pick_holes_lcms",
         "submit_experiment_day3",
+        "submit_experiment_day3_pick_holes_lcms",
         "submit_experiment_day4",
         "submit_experiment_day4_LCMS",
         "start_experiment",
@@ -491,7 +493,9 @@ def test_manual_confirm_node_types() -> None:
         "submit_experiment_day1",
         "prepare_cem",
         "submit_experiment_day2",
+        "submit_experiment_day2_pick_holes_lcms",
         "submit_experiment_day3",
+        "submit_experiment_day3_pick_holes_lcms",
         "submit_experiment_day4",
         "submit_experiment_day4_LCMS",
         "reset_auto",
@@ -519,7 +523,9 @@ def test_submit_and_reset_signatures_exclude_legacy_manual_confirm() -> None:
     for name in (
         "submit_experiment",
         "submit_experiment_day2",
+        "submit_experiment_day2_pick_holes_lcms",
         "submit_experiment_day3",
+        "submit_experiment_day3_pick_holes_lcms",
         "submit_experiment_day4",
         "submit_experiment_day4_LCMS",
         "reset_auto",
@@ -590,6 +596,8 @@ def test_typed_dicts_present() -> None:
         "PeptideDay1OptionalParams",
         "PeptideDay2RequiredParams",
         "PeptideDay2OptionalParams",
+        "PeptidePickHolesLCMSRequiredParams",
+        "PeptidePickHolesLCMSOptionalParams",
         "PeptideDay3RequiredParams",
         "PeptideDay3OptionalParams",
         "PeptideDay4RequiredParams",
@@ -605,6 +613,14 @@ def test_workflow_constants_split() -> None:
     assert module.DAY4_PEPTIDE_WORKFLOW_NAME == "Day4环肽酰化-酶标"
     assert module.DAY4_LCMS_PEPTIDE_WORKFLOW_NAME == "Day4环肽酰化-酶标+LCMS"
     assert module.DAY_WORKFLOW_BINDINGS["day4_lcms"]["sub_name"] == "Day4环肽酰化-酶标LCMS"
+    assert module.DAY_WORKFLOW_BINDINGS["day2_pick_holes_lcms"] == {
+        "root_name": "DAY2多肽定量_挑孔LCMS",
+        "sub_name": "DAY2多肽定量",
+    }
+    assert module.DAY_WORKFLOW_BINDINGS["day3_pick_holes_lcms"] == {
+        "root_name": "Day3线肽环化_挑孔LCMS",
+        "sub_name": "Day3线肽环化",
+    }
     assert module.DAY1_CEM_METHOD_DEFAULT == "5microdouble-20250911.MPM"
 
 
@@ -899,6 +915,231 @@ def test_submit_experiment_day2_can_skip_order_id_sync() -> None:
     assert result["material_registration"]["order_id_sync"]["requested"] is False
     assert result["materials_by_order_id"] == []
     station.hardware_interface.materials_by_order_id_result.assert_not_called()
+
+
+def test_submit_experiment_day2_pick_holes_lcms_injects_json_string_and_minimum_per_plate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    station = _make_station()
+    _wire_submit_pipeline(station)
+    station._flatten_step_parameters.return_value = FLATTENED_LIVE + [
+        {
+            "step": "39c78d4b-b5d3-f721-2001-9d52000084c6",
+            "step_name": "LCMS",
+            "Key": "LCMSHoles",
+            "m": 0,
+            "n": 0,
+            "Value": "",
+            "DisplayValue": "",
+            "TaskDisplayable": 1,
+        }
+    ]
+
+    stock_response = {
+        "ok": True,
+        "data": [
+            {
+                "id": "plate-1",
+                "name": "多肽样品96孔深孔板",
+                "barCode": "2026072301-9",
+                "detail": [
+                    {"code": "sample-A1"},
+                    {"code": "sample-H12"},
+                    {"code": "sample-A13"},
+                ],
+            },
+            {
+                "id": "plate-2",
+                "name": "96孔深孔板（待检测）",
+                "barCode": "2026072301-10",
+                "detail": [],
+            },
+        ],
+        "message": "",
+        "code": 1,
+    }
+
+    def stock_material_result(raw: str) -> Dict[str, Any]:
+        assert json.loads(raw)["typeMode"] == 1
+        return stock_response
+
+    station.hardware_interface.stock_material_result.side_effect = stock_material_result
+    station.hardware_interface.material_info_result.return_value = {
+        "ok": True,
+        "data": {"detail": [{"code": "sample-B2"}, {"code": "sample-B2"}]},
+        "message": "",
+        "code": 1,
+    }
+    module = _import_module()
+    monkeypatch.setattr(module.random, "choice", lambda wells: wells[0])
+    monkeypatch.setattr(module.random, "sample", lambda population, count: population[:count])
+
+    result = station.submit_experiment_day2_pick_holes_lcms(
+        {"sample_excel_pattern": "", "sample_well_count": 1},
+        {"parameter_overrides": [{"Key": "Example", "Value": "kept"}]},
+        sample_excel_relative_path="upload/sample/f.xlsx",
+    )
+
+    expected_holes = {
+        "2026072301-10": ["2,2"],
+        "2026072301-9": ["1,1"],
+    }
+    assert result["lcms_holes"] == expected_holes
+    assert "lcms_holes_json" not in result
+    assert "lcms_hole_selection" not in result
+    assert result["warnings"][0].startswith("requested_lcms_holes_increased:1->2")
+
+    order_payload = station._create_order.call_args.args[0]
+    sent_params = [
+        entry
+        for values in order_payload[0]["paramValues"].values()
+        for entry in values
+    ]
+    lcms_entry = next(entry for entry in sent_params if entry["key"] == "LCMSHoles")
+    assert isinstance(lcms_entry["value"], str)
+    assert json.loads(lcms_entry["value"]) == expected_holes
+    assert "DisplayValue" not in lcms_entry
+    assert any(entry["key"] == "Example" and entry["value"] == "kept" for entry in sent_params)
+
+
+def test_submit_experiment_pick_holes_lcms_caps_to_eligible_detail_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    station = _make_station()
+    _wire_submit_pipeline(station)
+    station._flatten_step_parameters.return_value = FLATTENED_LIVE + [
+        {
+            "step": "39c78d4b-b5d3-f721-2001-9d52000084c6",
+            "step_name": "LCMS",
+            "Key": "LCMSHoles",
+            "m": 0,
+            "n": 0,
+            "Value": "",
+            "TaskDisplayable": 1,
+        }
+    ]
+    station.hardware_interface.stock_material_result.return_value = {
+        "ok": True,
+        "data": [
+            {
+                "id": "plate-1",
+                "name": "96孔深孔板",
+                "barCode": "P1",
+                "detail": [{"code": "detail-A1"}, {"code": "detail-H12"}],
+            }
+        ],
+        "message": "",
+        "code": 1,
+    }
+    module = _import_module()
+    monkeypatch.setattr(module.random, "choice", lambda wells: wells[0])
+    monkeypatch.setattr(module.random, "sample", lambda population, count: population[:count])
+
+    result = station.submit_experiment_day2_pick_holes_lcms(
+        {"sample_excel_pattern": "", "sample_well_count": 99},
+        {},
+        sample_excel_relative_path="upload/sample/f.xlsx",
+    )
+
+    assert result["lcms_holes"] == {"P1": ["1,1", "8,12"]}
+    assert result["warnings"][0].startswith("requested_lcms_holes_capped:99->2")
+
+
+def test_collect_lcms_wells_rejects_stock_plate_without_detail_codes() -> None:
+    station = _make_station()
+    station.hardware_interface.stock_material_result.return_value = {
+        "ok": True,
+        "data": [
+            {
+                "id": "plate-empty",
+                "name": "96孔深孔板",
+                "barCode": "EMPTY",
+                "detail": [],
+            }
+        ],
+        "message": "",
+        "code": 1,
+    }
+    station.hardware_interface.material_info_result.return_value = {
+        "ok": True,
+        "data": {"detail": []},
+        "message": "",
+        "code": 1,
+    }
+
+    with pytest.raises(Exception, match="没有可从 detail-code 识别"):
+        station._collect_lcms_wells("upload/sample/f.xlsx")
+
+
+def test_read_lcms_holes_from_reference_excel() -> None:
+    station = _make_station()
+    workbook_path = REPO_ROOT / "temp" / "DPR019-20260723-thrombin-24plate-1.xlsx"
+    station._download_url_to_local = MagicMock(return_value={  # type: ignore[method-assign]
+        "file_path": str(workbook_path),
+    })
+
+    wells_by_plate = station._read_lcms_wells(r"upload\sample\reference.xlsx")
+
+    expected_barcodes = {
+        "2026072301-9": "96深孔板-1",
+        "2026072301-10": "96深孔板-2",
+        "2026072301-11": "96深孔板-3",
+        "2026072301-12": "96深孔板-4",
+    }
+    assert set(wells_by_plate) == set(expected_barcodes)
+    assert all(len(wells) == 16 for wells in wells_by_plate.values())
+    assert wells_by_plate["2026072301-9"] == {
+        "1,1", "1,2", "2,1", "2,2", "3,1", "3,2", "4,1", "4,2",
+        "5,1", "5,2", "6,1", "6,2", "7,1", "7,2", "8,1", "8,2",
+    }
+
+
+def test_collect_lcms_wells_falls_back_to_downloaded_sample_excel() -> None:
+    station = _make_station()
+    workbook_path = REPO_ROOT / "temp" / "DPR019-20260723-thrombin-24plate-1.xlsx"
+    station.hardware_interface.stock_material_result.return_value = {
+        "ok": True,
+        "data": [{"id": "other", "name": "其他物料"}],
+        "message": "",
+        "code": 1,
+    }
+    station._download_url_to_local = MagicMock(return_value={  # type: ignore[method-assign]
+        "file_path": str(workbook_path),
+        "file_name": workbook_path.name,
+        "source_url": "http://test/upload/sample/reference.xlsx",
+        "size": workbook_path.stat().st_size,
+        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })
+    wells_by_plate, warnings = station._collect_lcms_wells(
+        r"upload\sample\reference.xlsx",
+    )
+
+    assert len(wells_by_plate) == 4
+    assert sum(len(wells) for wells in wells_by_plate.values()) == 64
+    assert warnings == []
+    station.hardware_interface.stock_material_result.assert_called_once()
+    station._download_url_to_local.assert_called_once()
+
+
+def test_collect_lcms_wells_skips_empty_excel_plates() -> None:
+    station = _make_station()
+    station.hardware_interface.stock_material_result.return_value = {
+        "ok": True,
+        "data": [],
+        "message": "",
+        "code": 1,
+    }
+    station._read_lcms_wells = MagicMock(return_value={  # type: ignore[method-assign]
+            "EMPTY-PLATE": [],
+            "CONTENT-PLATE": ["1,1", "2,1"],
+    })
+
+    wells_by_plate, warnings = station._collect_lcms_wells(
+        r"upload\sample\reference.xlsx",
+    )
+
+    assert wells_by_plate == {"CONTENT-PLATE": ["1,1", "2,1"]}
+    assert warnings == ["empty_excel_plates_skipped:EMPTY-PLATE"]
 
 
 def test_submit_experiment_day1_calls_pipeline_and_injects_default_cem_method() -> None:

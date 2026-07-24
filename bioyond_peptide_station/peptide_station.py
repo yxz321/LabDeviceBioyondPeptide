@@ -7,6 +7,7 @@ import copy
 import json
 import mimetypes
 import os
+import random
 import re
 import sys
 import tempfile
@@ -175,13 +176,16 @@ DEFAULT_ERROR_HANDLING_IGNORE_TEXTS: Tuple[str, ...] = (
 )
 MATERIAL_TYPE_ORDER = ("Sample", "Consumables", "Reagent")
 PEPTIDE_SAMPLE_FILE_KEY = "SampleFile"
+LCMS_HOLES_KEY = "LCMSHoles"
 DAY1_CEM_METHOD_KEY = "CEMMethodFileName"
 DAY1_CEM_METHOD_DEFAULT = "5microdouble-20250911.MPM"
 
-# 绑定信息（最后更新 2026-05-16）
+# 绑定信息（最后更新 2026-07-23）
 DAY1_PEPTIDE_WORKFLOW_NAME = "Day1线肽合成"
 DAY2_PEPTIDE_WORKFLOW_NAME = "DAY2多肽定量"
+DAY2_PICK_HOLES_LCMS_WORKFLOW_NAME = "DAY2多肽定量_挑孔LCMS"
 DAY3_PEPTIDE_WORKFLOW_NAME = "Day3线肽环化"
+DAY3_PICK_HOLES_LCMS_WORKFLOW_NAME = "Day3线肽环化_挑孔LCMS"
 DAY4_PEPTIDE_WORKFLOW_NAME = "Day4环肽酰化-酶标"
 DAY4_LCMS_PEPTIDE_WORKFLOW_NAME = "Day4环肽酰化-酶标+LCMS"
 DAY4_LCMS_SUB_WORKFLOW_NAME = "Day4环肽酰化-酶标LCMS"
@@ -189,7 +193,15 @@ DAY4_LCMS_SUB_WORKFLOW_NAME = "Day4环肽酰化-酶标LCMS"
 DAY_WORKFLOW_BINDINGS: Dict[str, Dict[str, str]] = {
     "day1": {"root_name": DAY1_PEPTIDE_WORKFLOW_NAME, "sub_name": DAY1_PEPTIDE_WORKFLOW_NAME},
     "day2": {"root_name": DAY2_PEPTIDE_WORKFLOW_NAME, "sub_name": DAY2_PEPTIDE_WORKFLOW_NAME},
+    "day2_pick_holes_lcms": {
+        "root_name": DAY2_PICK_HOLES_LCMS_WORKFLOW_NAME,
+        "sub_name": DAY2_PEPTIDE_WORKFLOW_NAME,
+    },
     "day3": {"root_name": DAY3_PEPTIDE_WORKFLOW_NAME, "sub_name": DAY3_PEPTIDE_WORKFLOW_NAME},
+    "day3_pick_holes_lcms": {
+        "root_name": DAY3_PICK_HOLES_LCMS_WORKFLOW_NAME,
+        "sub_name": DAY3_PEPTIDE_WORKFLOW_NAME,
+    },
     "day4": {"root_name": DAY4_PEPTIDE_WORKFLOW_NAME, "sub_name": DAY4_PEPTIDE_WORKFLOW_NAME},
     "day4_lcms": {"root_name": DAY4_LCMS_PEPTIDE_WORKFLOW_NAME, "sub_name": DAY4_LCMS_SUB_WORKFLOW_NAME},
 }
@@ -314,6 +326,20 @@ class PeptideDay2RequiredParams(TypedDict):
 
 
 class PeptideDay2OptionalParams(PeptideCommonSubmitOptionalParams, total=False):
+    pass
+
+
+class PeptidePickHolesLCMSRequiredParams(PeptideDay2RequiredParams):
+    sample_well_count: Annotated[
+        int,
+        Field(
+            title="LCMS检测挑孔数量*",
+            description="填写本次 LCMS 检测需要随机抽取的有样品孔总数；系统会确保每块深孔板至少抽取一孔。",
+        ),
+    ]
+
+
+class PeptidePickHolesLCMSOptionalParams(PeptideCommonSubmitOptionalParams, total=False):
     pass
 
 
@@ -1871,6 +1897,52 @@ class BioyondPeptideStation(BioyondWorkstation):
 
     @action(
         always_free=True,
+        description="提交 Day2 多肽定量挑孔 LCMS 实验",
+        handles=[
+            ActionInputHandle(
+                key="sample_excel_relative_path",
+                data_type="bioyond_sample_file",
+                label="<sample_excel_relative_path>",
+                data_key="sample_excel_relative_path",
+                data_source=DataSource.HANDLE,
+                io_type="source",
+            ),
+            ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="order_ids", data_type="bioyond_order_ids", label="<order_ids>", data_key="order_ids", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="resultTable", data_type="table", label="装载确认表", data_key="resultTable", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="lcms_holes", data_type="json", label="LCMS检测挑孔", data_key="lcms_holes", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(
+                key="sample_excel_relative_path",
+                data_type="bioyond_sample_file",
+                label="<sample_excel_relative_path>",
+                data_key="sample_excel_relative_path",
+                data_source=DataSource.EXECUTOR,
+            ),
+        ],
+    )
+    def submit_experiment_day2_pick_holes_lcms(
+        self,
+        required_params: PeptidePickHolesLCMSRequiredParams,
+        optional_params: Optional[PeptidePickHolesLCMSOptionalParams] = None,
+        sample_excel_relative_path: str = "",
+    ) -> Dict[str, Any]:
+        """提交 Day2 多肽定量挑孔 LCMS 实验。
+
+        Args:
+            required_params[必填参数*]: 填写样品excel名称和 LCMS 检测需要随机抽取的有样品孔总数。
+            optional_params[可选参数]: 设置实验名称、物料同步、参数覆盖等可选行为。
+            sample_excel_relative_path[<sample_excel_relative_path>]: 上传或查询样品表后返回的内部文件路径，通常由上游节点传入。
+        """
+        # Day2/Day3 对外保留独立 action，内部复用同一套挑孔和提交逻辑。
+        return self._submit_pick_holes_lcms_experiment(
+            "day2_pick_holes_lcms",
+            required_params,
+            optional_params,
+            sample_excel_relative_path,
+        )
+
+    @action(
+        always_free=True,
         description="提交 Day3 线肽环化实验",
         handles=[
             ActionInputHandle(
@@ -1907,6 +1979,52 @@ class BioyondPeptideStation(BioyondWorkstation):
             sample_excel_relative_path[<sample_excel_relative_path>]: 上传或查询样品表后返回的内部文件路径，通常由上游节点传入。
         """
         return self._submit_experiment_core("day3", required_params, optional_params, sample_excel_relative_path)
+
+    @action(
+        always_free=True,
+        description="提交 Day3 线肽环化挑孔 LCMS 实验",
+        handles=[
+            ActionInputHandle(
+                key="sample_excel_relative_path",
+                data_type="bioyond_sample_file",
+                label="<sample_excel_relative_path>",
+                data_key="sample_excel_relative_path",
+                data_source=DataSource.HANDLE,
+                io_type="source",
+            ),
+            ActionOutputHandle(key="order_id", data_type="bioyond_order_id", label="<order_id>", data_key="order_id", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="order_ids", data_type="bioyond_order_ids", label="<order_ids>", data_key="order_ids", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="resultTable", data_type="table", label="装载确认表", data_key="resultTable", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(key="lcms_holes", data_type="json", label="LCMS检测挑孔", data_key="lcms_holes", data_source=DataSource.EXECUTOR),
+            ActionOutputHandle(
+                key="sample_excel_relative_path",
+                data_type="bioyond_sample_file",
+                label="<sample_excel_relative_path>",
+                data_key="sample_excel_relative_path",
+                data_source=DataSource.EXECUTOR,
+            ),
+        ],
+    )
+    def submit_experiment_day3_pick_holes_lcms(
+        self,
+        required_params: PeptidePickHolesLCMSRequiredParams,
+        optional_params: Optional[PeptidePickHolesLCMSOptionalParams] = None,
+        sample_excel_relative_path: str = "",
+    ) -> Dict[str, Any]:
+        """提交 Day3 线肽环化挑孔 LCMS 实验。
+
+        Args:
+            required_params[必填参数*]: 填写样品excel名称和 LCMS 检测需要随机抽取的有样品孔总数。
+            optional_params[可选参数]: 设置实验名称、物料同步、参数覆盖等可选行为。
+            sample_excel_relative_path[<sample_excel_relative_path>]: 上传或查询样品表后返回的内部文件路径，通常由上游节点传入。
+        """
+        # Day2/Day3 对外保留独立 action，内部复用同一套挑孔和提交逻辑。
+        return self._submit_pick_holes_lcms_experiment(
+            "day3_pick_holes_lcms",
+            required_params,
+            optional_params,
+            sample_excel_relative_path,
+        )
 
     @action(
         always_free=True,
@@ -2259,6 +2377,288 @@ class BioyondPeptideStation(BioyondWorkstation):
                 "material_registration": material_registration,
                 "warnings": warnings,
             }
+
+    def _submit_pick_holes_lcms_experiment(
+        self,
+        day_key: str,
+        required_params: Dict[str, Any],
+        optional_params: Optional[Dict[str, Any]],
+        sample_excel_relative_path: str,
+    ) -> Dict[str, Any]:
+        # 先归一化并校验用户填写的挑孔总数，避免 bool、空值或小数进入抽样逻辑。
+        required = dict(required_params or {})
+        requested_count = required.get("sample_well_count")
+        if isinstance(requested_count, bool):
+            raise PeptideWorkflowError("LCMS检测挑孔数量必须是正整数")
+        try:
+            requested_count_int = int(requested_count)
+        except (TypeError, ValueError) as exc:
+            raise PeptideWorkflowError("LCMS检测挑孔数量必须是正整数") from exc
+        if requested_count_int < 1 or requested_count_int != requested_count:
+            raise PeptideWorkflowError("LCMS检测挑孔数量必须是正整数")
+
+        # 提前解析唯一的样品 Excel；提交和库存缺失时的 Excel 回退共用该相对路径。
+        optional = dict(optional_params or {})
+        resolved_excel_path, _ = self._resolve_submit_sample_file(
+            required,
+            optional,
+            sample_excel_relative_path,
+        )
+
+        # 将 stock/Excel 统一归一化为 {板条码: 有内容孔集合}。
+        wells_by_plate, warnings = self._collect_lcms_wells(resolved_excel_path)
+        well_key = lambda value: tuple(int(part) for part in value.split(",", 1))
+        ordered_wells = {
+            barcode: sorted(wells, key=well_key)
+            for barcode, wells in sorted(wells_by_plate.items())
+        }
+
+        # 挑孔数量至少覆盖每块非空板，最多不超过全部有内容孔。
+        plate_count = len(ordered_wells)
+        available_count = sum(len(wells) for wells in ordered_wells.values())
+        effective_count = max(plate_count, min(requested_count_int, available_count))
+        if requested_count_int < plate_count:
+            warnings.append(
+                f"requested_lcms_holes_increased:{requested_count_int}->{effective_count}:"
+                "每块深孔板至少选择1孔"
+            )
+        if requested_count_int > available_count:
+            warnings.append(
+                f"requested_lcms_holes_capped:{requested_count_int}->{effective_count}:"
+                f"仅有{available_count}个有样品孔"
+            )
+
+        # 先为每板随机保底一孔，再从所有剩余孔中补足数量。
+        selected: Dict[str, List[str]] = {}
+        remaining: List[Tuple[str, str]] = []
+        for barcode, wells in ordered_wells.items():
+            guaranteed = random.choice(wells)
+            selected[barcode] = [guaranteed]
+            remaining.extend((barcode, well) for well in wells if well != guaranteed)
+        for barcode, well in random.sample(remaining, effective_count - plate_count):
+            selected[barcode].append(well)
+        for wells in selected.values():
+            wells.sort(key=well_key)
+
+        # LCMSHoles 的 Value 是 JSON 字符串；追加在最后，覆盖用户的同名参数。
+        # 放在最后可确保用户自定义 parameter_overrides 不会覆盖自动生成结果。
+        overrides = self._normalize_override_list(optional.get("parameter_overrides"), [])
+        overrides.append({
+            "Key": LCMS_HOLES_KEY,
+            "Value": json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
+        })
+        optional["parameter_overrides"] = overrides
+
+        # 复用标准实验提交管线，仅额外返回最终挑孔映射。
+        result = self._submit_experiment_core(
+            day_key,
+            required,
+            optional,
+            resolved_excel_path,
+        )
+        result["lcms_holes"] = selected
+        result["warnings"] = warnings + list(result.get("warnings") or [])
+        return result
+
+    def _collect_lcms_wells(
+        self,
+        sample_excel_relative_path: str,
+    ) -> Tuple[Dict[str, set[str]], List[str]]:
+        # 只查询样品库存（typeMode=1），并按名称包含关系识别所有96孔深孔板。
+        rpc = self._require_hardware_interface()
+        query = {"typeMode": 1, "includeDetail": True}
+        response = rpc.stock_material_result(json.dumps(query, ensure_ascii=False))
+        materials = response.get("data") if isinstance(response, dict) and response.get("ok") else []
+        if not isinstance(materials, list):
+            materials = []
+        plates = [
+            item
+            for item in materials
+            if isinstance(item, dict)
+            and "96孔深孔板" in str(item.get("name") or "").strip()
+        ]
+
+        # 未命中库存时改读 Excel；空板尚未进入奔曜，直接跳过。
+        if not plates:
+            excel_wells = self._read_lcms_wells(sample_excel_relative_path)
+            empty = sorted(barcode for barcode, wells in excel_wells.items() if not wells)
+            warnings = ["empty_excel_plates_skipped:" + ",".join(empty)] if empty else []
+            return {
+                barcode: wells
+                for barcode, wells in excel_wells.items()
+                if wells
+            }, warnings
+
+        # 库存命中时按条码聚合 detail-code；detail 为空则查询完整物料详情。
+        wells_by_plate: Dict[str, set[str]] = {}
+        for plate in plates:
+            barcode = str(plate.get("barCode") or plate.get("barcode") or "").strip()
+            material_id = str(
+                plate.get("id")
+                or plate.get("materialId")
+                or plate.get("material_id")
+                or plate.get("bioyond_id")
+                or ""
+            ).strip()
+            if not barcode:
+                raise PeptideWorkflowError(
+                    f"96孔深孔板缺少条码: material_id={material_id or '<unknown>'}"
+                )
+
+            details = plate.get("detail")
+            if not isinstance(details, list) or not details:
+                if not material_id:
+                    raise PeptideWorkflowError(f"96孔深孔板 {barcode} 缺少物料ID，无法查询孔位详情")
+                info_result = rpc.material_info_result(material_id)
+                if not isinstance(info_result, dict) or not info_result.get("ok"):
+                    message = str(info_result.get("message") or "") if isinstance(info_result, dict) else ""
+                    raise PeptideWorkflowError(
+                        f"查询96孔深孔板 {barcode} 的孔位详情失败: {message or material_id}"
+                    )
+                material_info = info_result.get("data")
+                details = material_info.get("detail") if isinstance(material_info, dict) else []
+
+            plate_wells = wells_by_plate.setdefault(barcode, set())
+            for detail in details if isinstance(details, list) else []:
+                if not isinstance(detail, dict):
+                    continue
+                detail_code = str(
+                    detail.get("code")
+                    or detail.get("detailCode")
+                    or detail.get("detail-code")
+                    or ""
+                ).strip()
+                match = re.search(r"(?:^|[-_])([A-Ha-h])(0?[1-9]|1[0-2])$", detail_code)
+                if match:
+                    row = ord(match.group(1).upper()) - ord("A") + 1
+                    plate_wells.add(f"{row},{int(match.group(2))}")
+
+        empty = sorted(barcode for barcode, wells in wells_by_plate.items() if not wells)
+        if empty:
+            raise PeptideWorkflowError(
+                "以下96孔深孔板没有可从 detail-code 识别的有样品孔，无法保证每板至少挑一孔: "
+                + ", ".join(empty)
+            )
+        return wells_by_plate, []
+
+    def _read_lcms_wells(self, sample_excel_relative_path: str) -> Dict[str, set[str]]:
+        # 下载样品 Excel 到临时目录。
+        relative_path = str(sample_excel_relative_path or "").strip().replace("\\", "/")
+        if not relative_path:
+            raise PeptideWorkflowError("库存中未找到96孔深孔板，且缺少样品 Excel 路径")
+        rpc = self._require_hardware_interface()
+        api_host = str(getattr(rpc, "host", "") or self.bioyond_config.get("api_host", "")).rstrip("/")
+        download_url = self._join_api_url(api_host, relative_path)
+        file_name = os.path.basename(relative_path) or "sample.xlsx"
+
+        # 下载器在未指定 download_dir 时自动创建临时目录，避免污染项目工作区。
+        downloaded = self._download_url_to_local(
+            download_url,
+            filename=file_name,
+            default_name="sample.xlsx",
+        )
+        local_path = str(downloaded.get("file_path") or "").strip()
+        if not local_path:
+            raise PeptideWorkflowError(f"样品 Excel 下载结果缺少本地路径: {downloaded}")
+
+        # 延迟导入并以只读模式打开本地副本。
+        try:
+            from openpyxl import load_workbook
+        except ImportError as exc:  # pragma: no cover - dependency is declared
+            raise PeptideWorkflowError("读取样品 Excel 需要安装 openpyxl") from exc
+        try:
+            workbook = load_workbook(local_path, read_only=True, data_only=True)
+        except Exception as exc:
+            raise PeptideWorkflowError(f"无法读取样品 Excel: {local_path}: {exc}") from exc
+
+        try:
+            # 从“条码汇总”定位板条码和明细工作表。
+            if "条码汇总" not in workbook.sheetnames:
+                raise PeptideWorkflowError("样品 Excel 缺少“条码汇总”工作表")
+            rows = list(workbook["条码汇总"].iter_rows(values_only=True))
+            if not rows:
+                raise PeptideWorkflowError("样品 Excel 的“条码汇总”工作表为空")
+            headers = {
+                str(value or "").strip(): index
+                for index, value in enumerate(rows[0])
+            }
+            required_headers = ("孔板类型", "孔板条码", "备注")
+            missing = [header for header in required_headers if header not in headers]
+            if missing:
+                raise PeptideWorkflowError(
+                    "样品 Excel 的“条码汇总”缺少列: " + ", ".join(missing)
+                )
+
+            wells_by_plate: Dict[str, set[str]] = {}
+            for row_index, row in enumerate(rows[1:], start=2):
+                plate_type = str(row[headers["孔板类型"]] or "").strip()
+                if "96孔深孔板" not in plate_type:
+                    continue
+                barcode = str(row[headers["孔板条码"]] or "").strip()
+                sheet_name = str(row[headers["备注"]] or "").strip()
+                if not barcode:
+                    raise PeptideWorkflowError(f"“条码汇总”第{row_index}行的96孔深孔板缺少孔板条码")
+                if not sheet_name:
+                    raise PeptideWorkflowError(f"“条码汇总”第{row_index}行的96孔深孔板缺少备注工作表名称")
+                if sheet_name not in workbook.sheetnames:
+                    # 兼容现场文件中“96孔深孔板-*”与“96深孔板-*”两种命名。
+                    suffix = re.search(r"(\d+)$", sheet_name)
+                    alternatives = []
+                    if suffix:
+                        alternatives = [
+                            f"96孔深孔板-{suffix.group(1)}",
+                            f"96深孔板-{suffix.group(1)}",
+                        ]
+                    sheet_name = next(
+                        (candidate for candidate in alternatives if candidate in workbook.sheetnames),
+                        sheet_name,
+                    )
+                if sheet_name not in workbook.sheetnames:
+                    raise PeptideWorkflowError(
+                        f"96孔深孔板 {barcode} 对应的工作表不存在: {sheet_name}"
+                    )
+
+                # 坐标列右侧任一字段非空，即认为该孔有样本。
+                plate_rows = list(workbook[sheet_name].iter_rows(values_only=True))
+                header_index = x_index = y_index = -1
+                for index, plate_row in enumerate(plate_rows):
+                    normalized = [str(value or "").strip() for value in plate_row]
+                    if "孔坐标X" in normalized and "孔坐标Y" in normalized:
+                        header_index = index
+                        x_index = normalized.index("孔坐标X")
+                        y_index = normalized.index("孔坐标Y")
+                        break
+                if header_index < 0:
+                    raise PeptideWorkflowError(
+                        f"96孔深孔板 {barcode} 的工作表缺少孔坐标X/孔坐标Y列"
+                    )
+
+                wells: set[str] = set()
+                content_start = max(x_index, y_index) + 1
+                for plate_row in plate_rows[header_index + 1:]:
+                    if max(x_index, y_index) >= len(plate_row):
+                        continue
+                    x_value = str(plate_row[x_index] or "").strip().upper()
+                    try:
+                        column = int(plate_row[y_index])
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        re.fullmatch(r"[A-H]", x_value)
+                        and 1 <= column <= 12
+                        and any(
+                            value is not None and str(value).strip()
+                            for value in plate_row[content_start:]
+                        )
+                    ):
+                        wells.add(f"{ord(x_value) - ord('A') + 1},{column}")
+                wells_by_plate[barcode] = wells
+
+            if not wells_by_plate:
+                raise PeptideWorkflowError("样品 Excel 的“条码汇总”中未找到96孔深孔板")
+            return wells_by_plate
+        finally:
+            workbook.close()
 
     @action(
         always_free=True,
