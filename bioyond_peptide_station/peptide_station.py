@@ -180,7 +180,7 @@ LCMS_HOLES_KEY = "LCMSHoles"
 DAY1_CEM_METHOD_KEY = "CEMMethodFileName"
 DAY1_CEM_METHOD_DEFAULT = "5microdouble-20250911.MPM"
 
-# 绑定信息（最后更新 2026-07-23）
+# 绑定信息（最后更新 2026-07-27）
 DAY1_PEPTIDE_WORKFLOW_NAME = "Day1线肽合成"
 DAY2_PEPTIDE_WORKFLOW_NAME = "DAY2多肽定量"
 DAY2_PICK_HOLES_LCMS_WORKFLOW_NAME = "DAY2多肽定量_挑孔LCMS"
@@ -195,12 +195,12 @@ DAY_WORKFLOW_BINDINGS: Dict[str, Dict[str, str]] = {
     "day2": {"root_name": DAY2_PEPTIDE_WORKFLOW_NAME, "sub_name": DAY2_PEPTIDE_WORKFLOW_NAME},
     "day2_pick_holes_lcms": {
         "root_name": DAY2_PICK_HOLES_LCMS_WORKFLOW_NAME,
-        "sub_name": DAY2_PEPTIDE_WORKFLOW_NAME,
+        "sub_name": DAY2_PICK_HOLES_LCMS_WORKFLOW_NAME,
     },
     "day3": {"root_name": DAY3_PEPTIDE_WORKFLOW_NAME, "sub_name": DAY3_PEPTIDE_WORKFLOW_NAME},
     "day3_pick_holes_lcms": {
         "root_name": DAY3_PICK_HOLES_LCMS_WORKFLOW_NAME,
-        "sub_name": DAY3_PEPTIDE_WORKFLOW_NAME,
+        "sub_name": DAY3_PICK_HOLES_LCMS_WORKFLOW_NAME,
     },
     "day4": {"root_name": DAY4_PEPTIDE_WORKFLOW_NAME, "sub_name": DAY4_PEPTIDE_WORKFLOW_NAME},
     "day4_lcms": {"root_name": DAY4_LCMS_PEPTIDE_WORKFLOW_NAME, "sub_name": DAY4_LCMS_SUB_WORKFLOW_NAME},
